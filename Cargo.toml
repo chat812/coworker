@@ -1,0 +1,20 @@
+[package]
+name = "coworker"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight MCP server for claude-peers network"
+
+[dependencies]
+rmcp = { version = "1", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+hostname = "0.4"
+dirs = "6"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
