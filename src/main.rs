@@ -469,7 +469,6 @@ impl CoworkerServer {
         match self.broker.post::<JoinChannelResult>("/join-channel", &body).await {
             Ok(r) if r.ok => {
                 let mut s = self.state.lock().await;
-                save_channel(s.git_root.as_deref(), &s.cwd, &r.channel);
                 s.channel = r.channel.clone();
                 s.role = r.role.clone();
                 drop(s);
@@ -506,7 +505,6 @@ impl CoworkerServer {
         match self.broker.post::<serde_json::Value>("/leave-channel", &body).await {
             Ok(_) => {
                 let mut s = self.state.lock().await;
-                save_channel(s.git_root.as_deref(), &s.cwd, "main");
                 s.channel = "main".to_string();
                 s.role = String::new();
                 drop(s);
@@ -604,30 +602,7 @@ impl ServerHandler for CoworkerServer {
                 }
             }
 
-            // --- Step 2: rejoin saved channel ---
-            let (cwd, git_root) = {
-                let s = state.lock().await;
-                (s.cwd.clone(), s.git_root.clone())
-            };
-            if let Some(saved_ch) = load_saved_channel(git_root.as_deref(), &cwd) {
-                if saved_ch != "main" {
-                    let body = serde_json::json!({ "id": peer_id, "channel": saved_ch });
-                    match broker.post::<JoinChannelResult>("/join-channel", &body).await {
-                        Ok(r) if r.ok => {
-                            let mut s = state.lock().await;
-                            save_channel(s.git_root.as_deref(), &s.cwd, &r.channel);
-                            s.channel = r.channel.clone();
-                            s.role = r.role.clone();
-                            flog!("Rejoined #{}", r.channel);
-                        }
-                        Ok(_) => {
-                            save_channel(git_root.as_deref(), &cwd, "main");
-                            flog!("Saved channel gone, staying in #main");
-                        }
-                        Err(e) => flog!("Rejoin error: {}", e),
-                    }
-                }
-            }
+            // Step 2: no channel persistence — always start in #main
 
             // --- Step 3: startup notifications ---
             // Small delay so Claude Code's channel listener is ready after the initialized handshake
@@ -862,58 +837,16 @@ const NAME_NOUNS: &[&str] = &[
     "sage", "stone", "summit", "tide", "valley", "vector", "wave", "wolf",
 ];
 
-fn generate_fancy_name() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Use time + pid as seed for randomness without a rand crate
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() as u128);
-    let mut h = DefaultHasher::new();
-    seed.hash(&mut h);
-    let v1 = h.finish() as usize;
-    seed.wrapping_add(1).hash(&mut h);
-    let v2 = h.finish() as usize;
-    let adj = NAME_ADJECTIVES[v1 % NAME_ADJECTIVES.len()];
-    let noun = NAME_NOUNS[v2 % NAME_NOUNS.len()];
-    format!("{}-{}", adj, noun)
-}
-
-fn load_saved_channel(git_root: Option<&str>, cwd: &str) -> Option<String> {
-    let dir = git_root.unwrap_or(cwd);
-    let path = std::path::Path::new(dir).join(".agent-hive").join("channel");
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn save_channel(git_root: Option<&str>, cwd: &str, channel: &str) {
-    let dir = git_root.unwrap_or(cwd);
-    let config_dir = std::path::Path::new(dir).join(".agent-hive");
-    let _ = std::fs::create_dir_all(&config_dir);
-    let _ = std::fs::write(config_dir.join("channel"), channel);
-}
-
-fn load_or_generate_name(git_root: Option<&str>, cwd: &str) -> String {
-    let dir = git_root.unwrap_or(cwd);
-    let config_dir = std::path::Path::new(dir).join(".agent-hive");
-    let name_path = config_dir.join("name");
-    // Try to read existing name
-    if let Ok(existing) = std::fs::read_to_string(&name_path) {
-        let trimmed = existing.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
+// Derive a stable name from the hostname — no file storage needed.
+// Same machine always gets the same name; approval is per hostname.
+fn name_from_hostname(hostname: &str) -> String {
+    let mut h: u32 = 5381;
+    for b in hostname.bytes() {
+        h = h.wrapping_mul(33) ^ b as u32;
     }
-    // Generate and persist
-    let name = generate_fancy_name();
-    let _ = std::fs::create_dir_all(&config_dir);
-    let _ = std::fs::write(&name_path, &name);
-    name
+    let adj = NAME_ADJECTIVES[(h as usize) % NAME_ADJECTIVES.len()];
+    let noun = NAME_NOUNS[((h >> 16) as usize) % NAME_NOUNS.len()];
+    format!("{}-{}", adj, noun)
 }
 
 fn get_git_root(cwd: &str) -> Option<String> {
@@ -1010,7 +943,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let my_name = load_or_generate_name(git_root.as_deref(), &cwd);
+    let my_name = name_from_hostname(&my_hostname);
 
     log(&format!("CWD: {}", cwd));
     log(&format!(
