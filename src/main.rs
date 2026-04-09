@@ -629,14 +629,17 @@ impl ServerHandler for CoworkerServer {
                 }
             }
 
-            // --- Step 3: startup notification ---
+            // --- Step 3: startup notifications ---
             // Small delay so Claude Code's channel listener is ready after the initialized handshake
             tokio::time::sleep(Duration::from_millis(1000)).await;
             {
                 let s = state.lock().await;
                 let name = s.name.clone();
                 let channel = s.channel.clone();
+                let role = s.role.clone();
                 drop(s);
+
+                // 3a: connected banner
                 let notification = CustomNotification::new(
                     "notifications/claude/channel",
                     Some(serde_json::json!({
@@ -651,6 +654,25 @@ impl ServerHandler for CoworkerServer {
                     })),
                 );
                 let _ = peer.send_notification(ServerNotification::CustomNotification(notification)).await;
+
+                // 3b: deliver role if already assigned (loaded from rejoin or approval)
+                if !role.is_empty() {
+                    flog!("Delivering startup role for #{}", channel);
+                    let role_notif = CustomNotification::new(
+                        "notifications/claude/channel",
+                        Some(serde_json::json!({
+                            "content": format!("[Your role in #{}]\n{}", channel, role),
+                            "meta": {
+                                "from_id": "agent-hive",
+                                "from_summary": "role assignment",
+                                "from_cwd": "",
+                                "from_harness": "agent-hive",
+                                "sent_at": now_iso(),
+                            }
+                        })),
+                    );
+                    let _ = peer.send_notification(ServerNotification::CustomNotification(role_notif)).await;
+                }
             }
 
             // --- Step 4: polling loop ---
