@@ -160,8 +160,11 @@ impl BrokerClient {
 
 struct PeerState {
     id: Option<String>,
+    name: String,
     cwd: String,
     git_root: Option<String>,
+    channel: String,
+    role: String,
 }
 
 // --- MCP Server ---
@@ -237,7 +240,17 @@ struct ChannelInfo {
 struct JoinChannelResult {
     ok: bool,
     channel: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    memory_keys: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatResponse {
+    #[serde(default)]
+    role: String,
 }
 
 #[tool_router]
@@ -439,9 +452,19 @@ impl CoworkerServer {
         let body = serde_json::json!({ "id": my_id, "channel": channel });
         match self.broker.post::<JoinChannelResult>("/join-channel", &body).await {
             Ok(r) if r.ok => {
-                let s = self.state.lock().await;
+                let mut s = self.state.lock().await;
                 save_channel(s.git_root.as_deref(), &s.cwd, &r.channel);
-                format!("Joined channel #{}", r.channel)
+                s.channel = r.channel.clone();
+                s.role = r.role.clone();
+                drop(s);
+                let mut parts = vec![format!("Joined channel #{}", r.channel)];
+                if !r.role.is_empty() {
+                    parts.push(format!("\n[Your role in this channel]\n{}", r.role));
+                }
+                if !r.memory_keys.is_empty() {
+                    parts.push(format!("\n[Channel memory keys: {}]", r.memory_keys.join(", ")));
+                }
+                parts.join("")
             }
             Ok(r) => format!("Failed to join channel: {}", r.error.unwrap_or_default()),
             Err(e) => format!("Error joining channel: {}", e),
@@ -466,8 +489,11 @@ impl CoworkerServer {
         let body = serde_json::json!({ "id": my_id });
         match self.broker.post::<serde_json::Value>("/leave-channel", &body).await {
             Ok(_) => {
-                let s = self.state.lock().await;
+                let mut s = self.state.lock().await;
                 save_channel(s.git_root.as_deref(), &s.cwd, "main");
+                s.channel = "main".to_string();
+                s.role = String::new();
+                drop(s);
                 "Left channel — back in #main".to_string()
             }
             Err(e) => format!("Error leaving channel: {}", e),
@@ -521,18 +547,39 @@ impl ServerHandler for CoworkerServer {
         let state = self.state.clone();
         let peer = context.peer.clone();
 
+        // Send startup channel notification
+        {
+            let s = state.lock().await;
+            let name = s.name.clone();
+            let channel = s.channel.clone();
+            drop(s);
+            let notification = CustomNotification::new(
+                "notifications/claude/channel",
+                Some(serde_json::json!({
+                    "content": format!("[Agent Hive] Connected as {} in #{}", name, channel),
+                    "meta": {
+                        "from_id": "agent-hive",
+                        "from_summary": "startup",
+                        "from_cwd": "",
+                        "from_harness": "agent-hive",
+                        "sent_at": now_iso(),
+                    }
+                })),
+            );
+            let _ = peer.send_notification(ServerNotification::CustomNotification(notification)).await;
+        }
+
         // Message polling loop
         tokio::spawn(async move {
             flog!("Polling loop task started");
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-
                 let my_id = {
                     let s = state.lock().await;
                     match &s.id {
                         Some(id) => id.clone(),
                         None => {
                             flog!("Poll: no peer ID yet, skipping");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
                     }
@@ -612,32 +659,96 @@ impl ServerHandler for CoworkerServer {
                         }
                     }
                 }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 
-        // Heartbeat loop
+        // Heartbeat loop — also detects role changes pushed by admin
         let broker2 = self.broker.clone();
         let state2 = self.state.clone();
+        let peer2 = context.peer.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
                 let my_id = {
                     let s = state2.lock().await;
                     match &s.id {
                         Some(id) => id.clone(),
-                        None => continue,
+                        None => {
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                            continue;
+                        }
                     }
                 };
                 let body = serde_json::json!({ "id": my_id });
-                let _ = broker2
-                    .post::<serde_json::Value>("/heartbeat", &body)
-                    .await;
+                if let Ok(hb) = broker2.post::<HeartbeatResponse>("/heartbeat", &body).await {
+                    let mut s = state2.lock().await;
+                    if hb.role != s.role {
+                        let prev = s.role.clone();
+                        s.role = hb.role.clone();
+                        let channel = s.channel.clone();
+                        drop(s);
+                        if !hb.role.is_empty() {
+                            flog!("Role updated: {}", &hb.role[..hb.role.len().min(80)]);
+                            let notification = CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": format!("[Your role in #{}]\n{}", channel, hb.role),
+                                    "meta": {
+                                        "from_id": "agent-hive",
+                                        "from_summary": "role assignment",
+                                        "from_cwd": "",
+                                        "from_harness": "agent-hive",
+                                        "sent_at": now_iso(),
+                                    }
+                                })),
+                            );
+                            let _ = peer2.send_notification(ServerNotification::CustomNotification(notification)).await;
+                        } else if !prev.is_empty() {
+                            flog!("Role cleared");
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         });
     }
 }
 
 // --- Utility functions ---
+
+fn now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Produce a basic ISO 8601 UTC string: YYYY-MM-DDTHH:MM:SSZ
+    let s = secs;
+    let (y, mo, d, h, mi, sec) = {
+        let mut rem = s;
+        let sec = rem % 60; rem /= 60;
+        let mi = rem % 60; rem /= 60;
+        let h = rem % 24; rem /= 24;
+        // days since epoch → date
+        let mut year = 1970u64;
+        loop {
+            let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
+            if rem < days_in_year { break; }
+            rem -= days_in_year;
+            year += 1;
+        }
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_month = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let mut month = 0usize;
+        for dim in &days_in_month {
+            if rem < *dim { break; }
+            rem -= *dim;
+            month += 1;
+        }
+        (year, month + 1, rem + 1, h, mi, sec)
+    };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, sec)
+}
 
 const NAME_ADJECTIVES: &[&str] = &[
     "amber", "arcane", "arctic", "azure", "bright", "cobalt", "crimson", "crystal",
@@ -677,7 +788,7 @@ fn generate_fancy_name() -> String {
 
 fn load_saved_channel(git_root: Option<&str>, cwd: &str) -> Option<String> {
     let dir = git_root.unwrap_or(cwd);
-    let path = std::path::Path::new(dir).join(".claude-peers").join("channel");
+    let path = std::path::Path::new(dir).join(".agent-hive").join("channel");
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -686,14 +797,14 @@ fn load_saved_channel(git_root: Option<&str>, cwd: &str) -> Option<String> {
 
 fn save_channel(git_root: Option<&str>, cwd: &str, channel: &str) {
     let dir = git_root.unwrap_or(cwd);
-    let config_dir = std::path::Path::new(dir).join(".claude-peers");
+    let config_dir = std::path::Path::new(dir).join(".agent-hive");
     let _ = std::fs::create_dir_all(&config_dir);
     let _ = std::fs::write(config_dir.join("channel"), channel);
 }
 
 fn load_or_generate_name(git_root: Option<&str>, cwd: &str) -> String {
     let dir = git_root.unwrap_or(cwd);
-    let config_dir = std::path::Path::new(dir).join(".claude-peers");
+    let config_dir = std::path::Path::new(dir).join(".agent-hive");
     let name_path = config_dir.join("name");
     // Try to read existing name
     if let Ok(existing) = std::fs::read_to_string(&name_path) {
@@ -726,7 +837,7 @@ fn get_git_root(cwd: &str) -> Option<String> {
 
 fn read_master_key() -> Option<String> {
     let home = dirs::home_dir()?;
-    let key_path = home.join(".claude-peers.key");
+    let key_path = home.join(".agent-hive.key");
     std::fs::read_to_string(key_path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -750,7 +861,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         broker.set_token(token).await;
     } else if let Some(key) = read_master_key() {
         broker.set_token(key).await;
-        log("Using master key from ~/.claude-peers.key");
+        log("Using master key from ~/.agent-hive.key");
     }
 
     // Ensure broker is running
@@ -758,9 +869,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if broker.is_local() {
             let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("coworker"));
             let broker_bin = exe.parent().unwrap().join(if cfg!(windows) {
-                "claude-peers-broker.exe"
+                "agent-hive-broker.exe"
             } else {
-                "claude-peers-broker"
+                "agent-hive-broker"
             });
 
             if broker_bin.exists() {
@@ -862,12 +973,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Rejoin last channel
+    let mut current_channel = "main".to_string();
+    let mut current_role = String::new();
     if let Some(saved_ch) = load_saved_channel(git_root.as_deref(), &cwd) {
         if saved_ch != "main" {
             let body = serde_json::json!({ "id": reg.id, "channel": saved_ch });
             match broker.post::<JoinChannelResult>("/join-channel", &body).await {
-                Ok(r) if r.ok => flog!("Rejoined saved channel #{}", r.channel),
-                Ok(_r) => {
+                Ok(r) if r.ok => {
+                    flog!("Rejoined saved channel #{}", r.channel);
+                    current_channel = r.channel.clone();
+                    current_role = r.role.clone();
+                    if !r.role.is_empty() { flog!("Role: {}", &r.role[..r.role.len().min(80)]); }
+                }
+                Ok(_) => {
                     flog!("Saved channel #{} no longer exists, falling back to #main", saved_ch);
                     save_channel(git_root.as_deref(), &cwd, "main");
                 }
@@ -879,8 +997,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up state
     let state = Arc::new(Mutex::new(PeerState {
         id: Some(reg.id.clone()),
+        name: my_name.clone(),
         cwd,
         git_root,
+        channel: current_channel,
+        role: current_role,
     }));
 
     // Create and run MCP server
