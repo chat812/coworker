@@ -212,20 +212,33 @@ struct SetSummaryParams {
     summary: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CheckMessagesParams {}
+// OpenAI-compatible empty schema: must include "properties": {} or Codex rejects it.
+// schemars 1.x derives {"type":"object"} without properties for empty structs, so we implement manually.
+macro_rules! empty_tool_params {
+    ($($name:ident),+) => {
+        $(
+            #[derive(Debug, Deserialize)]
+            struct $name {}
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ListChannelsParams {}
+            impl schemars::JsonSchema for $name {
+                fn schema_name() -> std::borrow::Cow<'static, str> {
+                    std::borrow::Cow::Borrowed(stringify!($name))
+                }
+                fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                    schemars::json_schema!({ "type": "object", "properties": {} })
+                }
+            }
+        )+
+    }
+}
+
+empty_tool_params!(CheckMessagesParams, ListChannelsParams, LeaveChannelParams);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct JoinChannelParams {
     #[schemars(description = "The channel name to join (e.g. 'backend-team')")]
     channel: String,
 }
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct LeaveChannelParams {}
 
 #[derive(Debug, Deserialize)]
 struct ChannelPeerSummary {
