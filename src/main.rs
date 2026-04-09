@@ -161,6 +161,7 @@ impl BrokerClient {
 struct PeerState {
     id: Option<String>,
     name: String,
+    token: Option<String>, // session token for approval polling
     cwd: String,
     git_root: Option<String>,
     channel: String,
@@ -173,14 +174,16 @@ struct PeerState {
 struct CoworkerServer {
     broker: Arc<BrokerClient>,
     state: Arc<Mutex<PeerState>>,
+    broker_url: String,
     tool_router: ToolRouter<Self>,
 }
 
 impl CoworkerServer {
-    fn new(broker: Arc<BrokerClient>, state: Arc<Mutex<PeerState>>) -> Self {
+    fn new(broker: Arc<BrokerClient>, state: Arc<Mutex<PeerState>>, broker_url: String) -> Self {
         Self {
             broker,
             state,
+            broker_url,
             tool_router: Self::tool_router(),
         }
     }
@@ -542,43 +545,108 @@ impl ServerHandler for CoworkerServer {
         &self,
         context: NotificationContext<RoleServer>,
     ) {
-        flog!("on_initialized called — starting polling and heartbeat loops");
+        flog!("on_initialized — waiting for approval then starting loops");
         let broker = self.broker.clone();
         let state = self.state.clone();
         let peer = context.peer.clone();
+        let broker_url = self.broker_url.clone();
 
-        // Send startup channel notification
-        {
-            let s = state.lock().await;
-            let name = s.name.clone();
-            let channel = s.channel.clone();
-            drop(s);
-            let notification = CustomNotification::new(
-                "notifications/claude/channel",
-                Some(serde_json::json!({
-                    "content": format!("[Agent Hive] Connected as {} in #{}", name, channel),
-                    "meta": {
-                        "from_id": "agent-hive",
-                        "from_summary": "startup",
-                        "from_cwd": "",
-                        "from_harness": "agent-hive",
-                        "sent_at": now_iso(),
-                    }
-                })),
-            );
-            let _ = peer.send_notification(ServerNotification::CustomNotification(notification)).await;
-        }
-
-        // Message polling loop
+        // All post-approval setup runs in one background task so MCP stays responsive
         tokio::spawn(async move {
-            flog!("Polling loop task started");
+            // --- Step 1: approval ---
+            let (token, peer_id) = {
+                let s = state.lock().await;
+                (s.token.clone().unwrap_or_default(), s.id.clone().unwrap_or_default())
+            };
+
+            // Try local auto-approve with master key
+            let mut approved = false;
+            if let Some(key) = read_master_key() {
+                let res = reqwest::Client::new()
+                    .post(format!("{}/auth/approve", broker_url))
+                    .bearer_auth(&key)
+                    .json(&serde_json::json!({ "peer_id": peer_id }))
+                    .send()
+                    .await;
+                if matches!(res, Ok(ref r) if r.status().is_success()) {
+                    flog!("Auto-approved (local + master key)");
+                    approved = true;
+                }
+            }
+
+            if !approved {
+                flog!("Waiting for admin approval...");
+                loop {
+                    let body = serde_json::json!({ "token": token });
+                    match broker.post::<AuthStatusResponse>("/auth/status", &body).await {
+                        Ok(r) if r.status == "approved" => { flog!("Approved!"); break; }
+                        Ok(r) if r.status == "rejected" => { flog!("Rejected — exiting"); return; }
+                        Ok(_) => {}
+                        Err(e) => flog!("Approval poll error: {}", e),
+                    }
+                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                }
+            }
+
+            // --- Step 2: rejoin saved channel ---
+            let (cwd, git_root) = {
+                let s = state.lock().await;
+                (s.cwd.clone(), s.git_root.clone())
+            };
+            if let Some(saved_ch) = load_saved_channel(git_root.as_deref(), &cwd) {
+                if saved_ch != "main" {
+                    let body = serde_json::json!({ "id": peer_id, "channel": saved_ch });
+                    match broker.post::<JoinChannelResult>("/join-channel", &body).await {
+                        Ok(r) if r.ok => {
+                            let mut s = state.lock().await;
+                            save_channel(s.git_root.as_deref(), &s.cwd, &r.channel);
+                            s.channel = r.channel.clone();
+                            s.role = r.role.clone();
+                            flog!("Rejoined #{}", r.channel);
+                        }
+                        Ok(_) => {
+                            save_channel(git_root.as_deref(), &cwd, "main");
+                            flog!("Saved channel gone, staying in #main");
+                        }
+                        Err(e) => flog!("Rejoin error: {}", e),
+                    }
+                }
+            }
+
+            // --- Step 3: startup notification ---
+            {
+                let s = state.lock().await;
+                let name = s.name.clone();
+                let channel = s.channel.clone();
+                drop(s);
+                let notification = CustomNotification::new(
+                    "notifications/claude/channel",
+                    Some(serde_json::json!({
+                        "content": format!("[Agent Hive] Connected as {} in #{}", name, channel),
+                        "meta": {
+                            "from_id": "agent-hive",
+                            "from_summary": "startup",
+                            "from_cwd": "",
+                            "from_harness": "agent-hive",
+                            "sent_at": now_iso(),
+                        }
+                    })),
+                );
+                let _ = peer.send_notification(ServerNotification::CustomNotification(notification)).await;
+            }
+
+            // --- Step 4: polling loop ---
+            let broker2 = broker.clone();
+            let state2 = state.clone();
+            let peer2 = peer.clone();
+            tokio::spawn(async move {
+            flog!("Polling loop started");
             loop {
                 let my_id = {
-                    let s = state.lock().await;
+                    let s = state2.lock().await;
                     match &s.id {
                         Some(id) => id.clone(),
                         None => {
-                            flog!("Poll: no peer ID yet, skipping");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -586,7 +654,7 @@ impl ServerHandler for CoworkerServer {
                 };
 
                 let body = serde_json::json!({ "id": my_id });
-                let result = match broker
+                let result = match broker2
                     .post::<PollMessagesResponse>("/poll-messages", &body)
                     .await
                 {
@@ -598,33 +666,26 @@ impl ServerHandler for CoworkerServer {
                     }
                     Err(e) => {
                         flog!("Poll error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
                 };
 
                 for msg in result.messages {
-                    // Skip internal system messages (role/memory delivery handled via API responses)
-                    if msg.from_id == "system" {
-                        continue;
-                    }
+                    if msg.from_id == "system" { continue; }
 
-                    // Look up sender info
                     let (from_summary, from_cwd, from_harness) = {
-                        let s = state.lock().await;
+                        let s = state2.lock().await;
                         let list_body = serde_json::json!({
                             "scope": "all",
                             "cwd": s.cwd,
                             "git_root": s.git_root,
                         });
                         drop(s);
-                        match broker.post::<Vec<Peer>>("/list-peers", &list_body).await {
+                        match broker2.post::<Vec<Peer>>("/list-peers", &list_body).await {
                             Ok(peers) => {
                                 if let Some(sender) = peers.iter().find(|p| p.id == msg.from_id) {
-                                    (
-                                        sender.summary.clone(),
-                                        sender.cwd.clone(),
-                                        sender.harness.clone(),
-                                    )
+                                    (sender.summary.clone(), sender.cwd.clone(), sender.harness.clone())
                                 } else {
                                     (String::new(), String::new(), String::new())
                                 }
@@ -647,70 +708,65 @@ impl ServerHandler for CoworkerServer {
                         })),
                     );
 
-                    flog!("Sending notification for message from {}", msg.from_id);
-                    match peer
-                        .send_notification(ServerNotification::CustomNotification(notification))
-                        .await
-                    {
+                    flog!("Notification for message from {}", msg.from_id);
+                    match peer2.send_notification(ServerNotification::CustomNotification(notification)).await {
                         Err(e) => flog!("Notification send error: {}", e),
                         Ok(_) => {
                             let preview: String = msg.text.chars().take(80).collect();
-                            flog!("Notification sent OK. Message: {}", preview);
+                            flog!("Sent OK: {}", preview);
                         }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+            }); // end polling spawn
 
-        // Heartbeat loop — also detects role changes pushed by admin
-        let broker2 = self.broker.clone();
-        let state2 = self.state.clone();
-        let peer2 = context.peer.clone();
-        tokio::spawn(async move {
-            loop {
-                let my_id = {
-                    let s = state2.lock().await;
-                    match &s.id {
-                        Some(id) => id.clone(),
-                        None => {
-                            tokio::time::sleep(Duration::from_secs(15)).await;
-                            continue;
+            // --- Step 5: heartbeat loop ---
+            let broker3 = broker.clone();
+            let state3 = state.clone();
+            let peer3 = peer.clone();
+            tokio::spawn(async move {
+                loop {
+                    let my_id = {
+                        let s = state3.lock().await;
+                        match &s.id {
+                            Some(id) => id.clone(),
+                            None => { tokio::time::sleep(Duration::from_secs(15)).await; continue; }
+                        }
+                    };
+                    let body = serde_json::json!({ "id": my_id });
+                    if let Ok(hb) = broker3.post::<HeartbeatResponse>("/heartbeat", &body).await {
+                        let mut s = state3.lock().await;
+                        if hb.role != s.role {
+                            let prev = s.role.clone();
+                            s.role = hb.role.clone();
+                            let channel = s.channel.clone();
+                            drop(s);
+                            if !hb.role.is_empty() {
+                                flog!("Role updated: {}", &hb.role[..hb.role.len().min(80)]);
+                                let notification = CustomNotification::new(
+                                    "notifications/claude/channel",
+                                    Some(serde_json::json!({
+                                        "content": format!("[Your role in #{}]\n{}", channel, hb.role),
+                                        "meta": {
+                                            "from_id": "agent-hive",
+                                            "from_summary": "role assignment",
+                                            "from_cwd": "",
+                                            "from_harness": "agent-hive",
+                                            "sent_at": now_iso(),
+                                        }
+                                    })),
+                                );
+                                let _ = peer3.send_notification(ServerNotification::CustomNotification(notification)).await;
+                            } else if !prev.is_empty() {
+                                flog!("Role cleared");
+                            }
                         }
                     }
-                };
-                let body = serde_json::json!({ "id": my_id });
-                if let Ok(hb) = broker2.post::<HeartbeatResponse>("/heartbeat", &body).await {
-                    let mut s = state2.lock().await;
-                    if hb.role != s.role {
-                        let prev = s.role.clone();
-                        s.role = hb.role.clone();
-                        let channel = s.channel.clone();
-                        drop(s);
-                        if !hb.role.is_empty() {
-                            flog!("Role updated: {}", &hb.role[..hb.role.len().min(80)]);
-                            let notification = CustomNotification::new(
-                                "notifications/claude/channel",
-                                Some(serde_json::json!({
-                                    "content": format!("[Your role in #{}]\n{}", channel, hb.role),
-                                    "meta": {
-                                        "from_id": "agent-hive",
-                                        "from_summary": "role assignment",
-                                        "from_cwd": "",
-                                        "from_harness": "agent-hive",
-                                        "sent_at": now_iso(),
-                                    }
-                                })),
-                            );
-                            let _ = peer2.send_notification(ServerNotification::CustomNotification(notification)).await;
-                        } else if !prev.is_empty() {
-                            flog!("Role cleared");
-                        }
-                    }
+                    tokio::time::sleep(Duration::from_secs(15)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        });
+            }); // end heartbeat spawn
+        }); // end outer approval spawn
     }
 }
 
@@ -950,62 +1006,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Switch to session token
     broker.set_token(reg.token.clone()).await;
 
-    // Auto-approve if local + have master key
-    if broker.is_local() {
-        if let Some(master_key) = read_master_key() {
-            let approve_res = reqwest::Client::new()
-                .post(format!("{}/auth/approve", broker_url))
-                .bearer_auth(&master_key)
-                .json(&serde_json::json!({ "peer_id": reg.id }))
-                .send()
-                .await;
-            match approve_res {
-                Ok(r) if r.status().is_success() => log("Auto-approved (local + master key)"),
-                _ => {
-                    wait_for_approval(&broker, &reg.token).await?;
-                }
-            }
-        } else {
-            wait_for_approval(&broker, &reg.token).await?;
-        }
-    } else {
-        wait_for_approval(&broker, &reg.token).await?;
-    }
-
-    // Rejoin last channel
-    let mut current_channel = "main".to_string();
-    let mut current_role = String::new();
-    if let Some(saved_ch) = load_saved_channel(git_root.as_deref(), &cwd) {
-        if saved_ch != "main" {
-            let body = serde_json::json!({ "id": reg.id, "channel": saved_ch });
-            match broker.post::<JoinChannelResult>("/join-channel", &body).await {
-                Ok(r) if r.ok => {
-                    flog!("Rejoined saved channel #{}", r.channel);
-                    current_channel = r.channel.clone();
-                    current_role = r.role.clone();
-                    if !r.role.is_empty() { flog!("Role: {}", &r.role[..r.role.len().min(80)]); }
-                }
-                Ok(_) => {
-                    flog!("Saved channel #{} no longer exists, falling back to #main", saved_ch);
-                    save_channel(git_root.as_deref(), &cwd, "main");
-                }
-                Err(e) => flog!("Failed to rejoin channel: {}", e),
-            }
-        }
-    }
-
-    // Set up state
+    // Set up state — approval and channel rejoin happen in on_initialized background task
     let state = Arc::new(Mutex::new(PeerState {
         id: Some(reg.id.clone()),
         name: my_name.clone(),
+        token: Some(reg.token.clone()),
         cwd,
         git_root,
-        channel: current_channel,
-        role: current_role,
+        channel: "main".to_string(),
+        role: String::new(),
     }));
 
-    // Create and run MCP server
-    let server = CoworkerServer::new(broker.clone(), state);
+    // Create and run MCP server (starts immediately, no blocking on approval)
+    let server = CoworkerServer::new(broker.clone(), state, broker_url.clone());
     let (stdin, stdout) = rmcp::transport::stdio();
 
     log("Starting MCP server on stdio...");
@@ -1039,32 +1052,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn wait_for_approval(
-    broker: &BrokerClient,
-    token: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    log("Waiting for admin approval...");
-    loop {
-        let body = serde_json::json!({ "token": token });
-        match broker
-            .post::<AuthStatusResponse>("/auth/status", &body)
-            .await
-        {
-            Ok(r) if r.status == "approved" => {
-                log("Approved by admin!");
-                return Ok(());
-            }
-            Ok(r) if r.status == "rejected" => {
-                return Err("Connection rejected by admin".into());
-            }
-            Ok(_) => {} // still pending
-            Err(e) => {
-                if e.contains("rejected") {
-                    return Err(e.into());
-                }
-                log(&format!("Approval poll error: {}", e));
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
