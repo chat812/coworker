@@ -847,26 +847,44 @@ fn name_from_str(s: &str) -> String {
     format!("{}-{}", adj, noun)
 }
 
-// Derive a unique-per-session name. Priority:
-//   1. AGENT_HIVE_NAME env override
-//   2. CLAUDE_CODE_SESSION_ID env var (set by Claude Code for MCP subprocesses if available)
-//   3. hostname + PID — unique per session (each Claude restart is a new process)
-fn get_agent_name(hostname: &str) -> String {
+// Returns a stable name for this project on this machine.
+// Stored in ~/.agent-hive-names.json keyed by project path (git root or cwd).
+// This survives `claude --resume` since the project path doesn't change.
+//
+// Priority:
+//   1. AGENT_HIVE_NAME env override (manual)
+//   2. ~/.agent-hive-names.json[project_path] (stable per project)
+//   3. Generate from hostname+project, persist to file, return
+fn get_agent_name(hostname: &str, git_root: Option<&str>, cwd: &str) -> String {
     if let Ok(name) = env::var("AGENT_HIVE_NAME") {
         let n = name.trim().to_string();
         if !n.is_empty() { return n; }
     }
-    for var in &["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"] {
-        if let Ok(val) = env::var(var) {
-            let val = val.trim().to_string();
-            if !val.is_empty() {
-                flog!("Using session ID from {} for name", var);
-                return name_from_str(&val);
-            }
-        }
+
+    let project_key = git_root.unwrap_or(cwd).to_string();
+    let names_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agent-hive-names.json");
+
+    // Load existing map
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&names_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    if let Some(existing) = map.get(&project_key).and_then(|v| v.as_str()) {
+        return existing.to_string();
     }
-    // Fall back: hostname + PID gives a name unique per session
-    name_from_str(&format!("{}-{}", hostname, std::process::id()))
+
+    // Generate new name, persist it
+    let name = name_from_str(&format!("{}-{}", hostname, &project_key));
+    map.insert(project_key, serde_json::Value::String(name.clone()));
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&names_path, json);
+    }
+    flog!("Generated new name '{}', saved to ~/.agent-hive-names.json", name);
+    name
 }
 
 fn get_git_root(cwd: &str) -> Option<String> {
@@ -963,7 +981,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let my_name = get_agent_name(&my_hostname);
+    let my_name = get_agent_name(&my_hostname, git_root.as_deref(), &cwd);
 
     log(&format!("CWD: {}", cwd));
     log(&format!(
