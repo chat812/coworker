@@ -837,16 +837,36 @@ const NAME_NOUNS: &[&str] = &[
     "sage", "stone", "summit", "tide", "valley", "vector", "wave", "wolf",
 ];
 
-// Derive a stable name from the hostname — no file storage needed.
-// Same machine always gets the same name; approval is per hostname.
-fn name_from_hostname(hostname: &str) -> String {
+fn name_from_str(s: &str) -> String {
     let mut h: u32 = 5381;
-    for b in hostname.bytes() {
+    for b in s.bytes() {
         h = h.wrapping_mul(33) ^ b as u32;
     }
     let adj = NAME_ADJECTIVES[(h as usize) % NAME_ADJECTIVES.len()];
     let noun = NAME_NOUNS[((h >> 16) as usize) % NAME_NOUNS.len()];
     format!("{}-{}", adj, noun)
+}
+
+// Derive a unique-per-session name. Priority:
+//   1. AGENT_HIVE_NAME env override
+//   2. CLAUDE_CODE_SESSION_ID env var (set by Claude Code for MCP subprocesses if available)
+//   3. hostname + PID — unique per session (each Claude restart is a new process)
+fn get_agent_name(hostname: &str) -> String {
+    if let Ok(name) = env::var("AGENT_HIVE_NAME") {
+        let n = name.trim().to_string();
+        if !n.is_empty() { return n; }
+    }
+    for var in &["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"] {
+        if let Ok(val) = env::var(var) {
+            let val = val.trim().to_string();
+            if !val.is_empty() {
+                flog!("Using session ID from {} for name", var);
+                return name_from_str(&val);
+            }
+        }
+    }
+    // Fall back: hostname + PID gives a name unique per session
+    name_from_str(&format!("{}-{}", hostname, std::process::id()))
 }
 
 fn get_git_root(cwd: &str) -> Option<String> {
@@ -943,7 +963,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let my_name = name_from_hostname(&my_hostname);
+    let my_name = get_agent_name(&my_hostname);
 
     log(&format!("CWD: {}", cwd));
     log(&format!(
