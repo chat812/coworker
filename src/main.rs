@@ -614,6 +614,8 @@ impl ServerHandler for CoworkerServer {
             }
 
             // --- Step 3: startup notification ---
+            // Small delay so Claude Code's channel listener is ready after the initialized handshake
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             {
                 let s = state.lock().await;
                 let name = s.name.clone();
