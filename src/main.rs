@@ -17,6 +17,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler, ServiceExt};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose};
 use tokio::sync::Mutex;
 
 // --- Logging ---
@@ -242,7 +243,7 @@ macro_rules! empty_tool_params {
     }
 }
 
-empty_tool_params!(CheckMessagesParams, ListChannelsParams, LeaveChannelParams, MemoryListParams);
+empty_tool_params!(CheckMessagesParams, ListChannelsParams, LeaveChannelParams, MemoryListParams, ListFilesParams);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct JoinChannelParams {
@@ -268,6 +269,20 @@ struct MemoryGetParams {
 struct MemoryDeleteParams {
     #[schemars(description = "The key to delete")]
     key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UploadFileParams {
+    #[schemars(description = "Path to the local file to upload to the channel file store")]
+    path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DownloadFileParams {
+    #[schemars(description = "The file_id returned by upload_file or list_files")]
+    file_id: String,
+    #[schemars(description = "Local path where the downloaded file should be saved")]
+    save_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -659,6 +674,101 @@ impl CoworkerServer {
                 "Left channel — back in #main".to_string()
             }
             Err(e) => format!("Error leaving channel: {}", e),
+        }
+    }
+
+    #[tool(description = "Upload a local file to the shared channel file store. Other agents can download it using the returned file_id. Max 10MB.")]
+    async fn upload_file(
+        &self,
+        Parameters(UploadFileParams { path }): Parameters<UploadFileParams>,
+    ) -> String {
+        let state = self.state.lock().await;
+        let peer_id = match &state.id {
+            Some(id) => id.clone(),
+            None => return "Not registered with broker".to_string(),
+        };
+        let channel = state.channel.clone();
+        drop(state);
+
+        let p = std::path::Path::new(&path);
+        let filename = p.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+
+        let contents = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => return format!("Failed to read file: {}", e),
+        };
+
+        let content_b64 = general_purpose::STANDARD.encode(&contents);
+
+        match self.broker.post::<serde_json::Value>("/file-upload", &serde_json::json!({
+            "peer_id": peer_id,
+            "filename": filename,
+            "content_b64": content_b64,
+            "channel": channel,
+        })).await {
+            Ok(v) => {
+                let file_id = v["file_id"].as_str().unwrap_or("unknown");
+                format!("Uploaded '{}' — file_id: {}", filename, file_id)
+            }
+            Err(e) => format!("Upload failed: {}", e),
+        }
+    }
+
+    #[tool(description = "Download a file from the channel file store by file_id and save it to a local path.")]
+    async fn download_file(
+        &self,
+        Parameters(DownloadFileParams { file_id, save_path }): Parameters<DownloadFileParams>,
+    ) -> String {
+        let url = format!("{}/files/{}", self.broker_url, file_id);
+        let res = match self.broker.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return format!("Download failed: {}", e),
+        };
+        if !res.status().is_success() {
+            return format!("Download failed: HTTP {}", res.status());
+        }
+        let bytes = match res.bytes().await {
+            Ok(b) => b,
+            Err(e) => return format!("Failed to read response: {}", e),
+        };
+        match std::fs::write(&save_path, &bytes) {
+            Ok(_) => format!("Saved {} bytes to {}", bytes.len(), save_path),
+            Err(e) => format!("Failed to write file: {}", e),
+        }
+    }
+
+    #[tool(description = "List files shared in the current channel.")]
+    async fn list_files(
+        &self,
+        _: Parameters<ListFilesParams>,
+    ) -> String {
+        let channel = self.state.lock().await.channel.clone();
+        match self.broker.post::<serde_json::Value>("/file-list", &serde_json::json!({ "channel": channel })).await {
+            Ok(v) => {
+                let files = v["files"].as_array().cloned().unwrap_or_default();
+                if files.is_empty() {
+                    return format!("No files in #{}", channel);
+                }
+                let mut out = format!("Files in #{}:\n", channel);
+                for f in &files {
+                    let id = f["id"].as_str().unwrap_or("");
+                    let name = f["filename"].as_str().unwrap_or("");
+                    let size = f["size"].as_u64().unwrap_or(0);
+                    let uploader = f["peer_name"].as_str().unwrap_or("");
+                    let size_str = if size >= 1024 * 1024 {
+                        format!("{:.1}MB", size as f64 / 1024.0 / 1024.0)
+                    } else if size >= 1024 {
+                        format!("{:.1}KB", size as f64 / 1024.0)
+                    } else {
+                        format!("{}B", size)
+                    };
+                    out.push_str(&format!("  {} | {} | {} | {}\n", id, name, size_str, uploader));
+                }
+                out
+            }
+            Err(e) => format!("Failed: {}", e),
         }
     }
 }
