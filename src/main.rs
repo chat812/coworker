@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -17,7 +18,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler, ServiceExt};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
-use base64::{Engine as _, engine::general_purpose};
+use std::io::Read;
 use tokio::sync::Mutex;
 
 // --- Logging ---
@@ -99,6 +100,30 @@ struct SendResult {
     error: Option<String>,
 }
 
+// --- Token tracker ---
+
+#[derive(Default)]
+struct TokenTracker {
+    tokens_in: AtomicU64,
+    tokens_out: AtomicU64,
+}
+
+impl TokenTracker {
+    /// Estimate token count: 1 token ≈ 4 bytes of text
+    fn estimate(bytes: usize) -> u64 {
+        ((bytes as u64) + 3) / 4
+    }
+    fn add_in(&self, bytes: usize) {
+        self.tokens_in.fetch_add(Self::estimate(bytes), Ordering::Relaxed);
+    }
+    fn add_out(&self, bytes: usize) {
+        self.tokens_out.fetch_add(Self::estimate(bytes), Ordering::Relaxed);
+    }
+    fn get(&self) -> (u64, u64) {
+        (self.tokens_in.load(Ordering::Relaxed), self.tokens_out.load(Ordering::Relaxed))
+    }
+}
+
 // --- Broker client ---
 
 struct BrokerClient {
@@ -147,6 +172,29 @@ impl BrokerClient {
             .map_err(|e| format!("Broker response parse error ({}): {}", path, e))
     }
 
+    async fn post_multipart<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<T, String> {
+        let token = self.token.lock().await.clone();
+        let mut req = self.http
+            .post(format!("{}{}", self.broker_url, path))
+            .multipart(form);
+        if let Some(ref t) = token {
+            req = req.bearer_auth(t);
+        }
+        let res = req.send().await
+            .map_err(|e| format!("Broker request failed ({}): {}", path, e))?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("Broker error ({}): {} {}", path, status, text));
+        }
+        res.json().await
+            .map_err(|e| format!("Broker response parse error ({}): {}", path, e))
+    }
+
     async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.broker_url);
         match self
@@ -187,6 +235,7 @@ struct CoworkerServer {
     state: Arc<Mutex<PeerState>>,
     broker_url: String,
     tool_router: ToolRouter<Self>,
+    tokens: Arc<TokenTracker>,
 }
 
 impl CoworkerServer {
@@ -196,6 +245,7 @@ impl CoworkerServer {
             state,
             broker_url,
             tool_router: Self::tool_router(),
+            tokens: Arc::new(TokenTracker::default()),
         }
     }
 }
@@ -273,16 +323,50 @@ struct MemoryDeleteParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct UploadFileParams {
-    #[schemars(description = "Path to the local file to upload to the channel file store")]
+    #[schemars(description = "Path to the local file to upload")]
     path: String,
+    #[schemars(description = "Logical name in the file store, e.g. 'datasets/model.pkl'. Uploading to the same store_path creates a new version. Defaults to the filename.")]
+    #[serde(default)]
+    store_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DownloadFileParams {
-    #[schemars(description = "The file_id returned by upload_file or list_files")]
-    file_id: String,
+    #[schemars(description = "Specific file_id to download (pinned version). Use this or store_path.")]
+    #[serde(default)]
+    file_id: Option<String>,
+    #[schemars(description = "Logical store path to download the latest version, e.g. 'datasets/model.pkl'. Use this or file_id.")]
+    #[serde(default)]
+    store_path: Option<String>,
     #[schemars(description = "Local path where the downloaded file should be saved")]
     save_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UploadFolderParams {
+    #[schemars(description = "Local folder path to zip and upload")]
+    path: String,
+    #[schemars(description = "Logical name in the file store, e.g. 'project/src'. Defaults to foldername.zip. Creates a new version each upload.")]
+    #[serde(default)]
+    store_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DownloadFolderParams {
+    #[schemars(description = "Specific file_id of the zip to download and extract")]
+    #[serde(default)]
+    file_id: Option<String>,
+    #[schemars(description = "Logical store path of the zip, downloads the latest version")]
+    #[serde(default)]
+    store_path: Option<String>,
+    #[schemars(description = "Local directory path to extract the zip into")]
+    extract_to: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BroadcastParams {
+    #[schemars(description = "Message to send to all peers in the current channel")]
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +409,62 @@ struct MemoryGetResult {
 struct HeartbeatResponse {
     #[serde(default)]
     role: String,
+    #[serde(default)]
+    abort: bool,
+}
+
+impl CoworkerServer {
+    async fn upload_file_inner(&self, local_path: &str, store_path: &str) -> String {
+        let state = self.state.lock().await;
+        let peer_id = match &state.id {
+            Some(id) => id.clone(),
+            None => return "Not registered with broker".to_string(),
+        };
+        let channel = state.channel.clone();
+        drop(state);
+
+        let p = std::path::Path::new(local_path);
+        let filename = p.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+
+        let contents = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => return format!("Failed to read file: {}", e),
+        };
+        let size = contents.len();
+
+        let part = match reqwest::multipart::Part::bytes(contents)
+            .file_name(filename.clone())
+            .mime_str("application/octet-stream")
+        {
+            Ok(p) => p,
+            Err(e) => return format!("Failed to create multipart: {}", e),
+        };
+
+        let form = reqwest::multipart::Form::new()
+            .text("peer_id", peer_id)
+            .text("channel", channel)
+            .text("store_path", store_path.to_string())
+            .part("file", part);
+
+        match self.broker.post_multipart::<serde_json::Value>("/file-upload", form).await {
+            Ok(v) => {
+                let file_id = v["file_id"].as_str().unwrap_or("unknown");
+                let version = v["version"].as_u64().unwrap_or(1);
+                let path = v["path"].as_str().unwrap_or(&filename);
+                let size_str = if size >= 1024 * 1024 {
+                    format!("{:.1}MB", size as f64 / 1024.0 / 1024.0)
+                } else if size >= 1024 {
+                    format!("{:.1}KB", size as f64 / 1024.0)
+                } else {
+                    format!("{}B", size)
+                };
+                format!("Uploaded '{}' v{} ({}) — file_id: {}", path, version, size_str, file_id)
+            }
+            Err(e) => format!("Upload failed: {}", e),
+        }
+    }
 }
 
 #[tool_router]
@@ -375,12 +515,14 @@ impl CoworkerServer {
                         parts.join("\n  ")
                     })
                     .collect();
-                format!(
+                let result = format!(
                     "Found {} peer(s) (scope: {}):\n\n{}",
                     peers.len(),
                     scope,
                     lines.join("\n\n")
-                )
+                );
+                self.tokens.add_in(result.len());
+                result
             }
             Err(e) => format!("Error listing peers: {}", e),
         }
@@ -400,6 +542,8 @@ impl CoworkerServer {
             None => return "Not registered with broker yet".to_string(),
         };
         drop(state);
+
+        self.tokens.add_out(message.len());
 
         let body = serde_json::json!({
             "from_id": my_id,
@@ -464,11 +608,13 @@ impl CoworkerServer {
                     .iter()
                     .map(|m| format!("From {} ({}):\n{}", m.from_id, m.sent_at, m.text))
                     .collect();
-                format!(
+                let result = format!(
                     "{} new message(s):\n\n{}",
                     r.messages.len(),
                     lines.join("\n\n---\n\n")
-                )
+                );
+                self.tokens.add_in(result.len());
+                result
             }
             Err(e) => format!("Error checking messages: {}", e),
         }
@@ -560,6 +706,8 @@ impl CoworkerServer {
         let channel = state.channel.clone();
         drop(state);
 
+        self.tokens.add_out(value.len());
+
         let body = serde_json::json!({
             "channel": channel,
             "peer_id": my_id,
@@ -585,7 +733,10 @@ impl CoworkerServer {
 
         let body = serde_json::json!({ "channel": channel, "key": key });
         match self.broker.post::<MemoryGetResult>("/memory-get", &body).await {
-            Ok(r) => r.value,
+            Ok(r) => {
+                self.tokens.add_in(r.value.len());
+                r.value
+            }
             Err(e) => format!("Error reading memory key \"{}\": {}", key, e),
         }
     }
@@ -677,51 +828,43 @@ impl CoworkerServer {
         }
     }
 
-    #[tool(description = "Upload a local file to the shared channel file store. Other agents can download it using the returned file_id. Max 10MB.")]
+    #[tool(description = "Upload a local file to the shared channel file store. Use store_path to give it a logical name for versioning — uploading to the same store_path creates a new version.")]
     async fn upload_file(
         &self,
-        Parameters(UploadFileParams { path }): Parameters<UploadFileParams>,
+        Parameters(UploadFileParams { path, store_path }): Parameters<UploadFileParams>,
     ) -> String {
-        let state = self.state.lock().await;
-        let peer_id = match &state.id {
-            Some(id) => id.clone(),
-            None => return "Not registered with broker".to_string(),
-        };
-        let channel = state.channel.clone();
-        drop(state);
-
         let p = std::path::Path::new(&path);
         let filename = p.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
-
-        let contents = match std::fs::read(p) {
-            Ok(b) => b,
-            Err(e) => return format!("Failed to read file: {}", e),
-        };
-
-        let content_b64 = general_purpose::STANDARD.encode(&contents);
-
-        match self.broker.post::<serde_json::Value>("/file-upload", &serde_json::json!({
-            "peer_id": peer_id,
-            "filename": filename,
-            "content_b64": content_b64,
-            "channel": channel,
-        })).await {
-            Ok(v) => {
-                let file_id = v["file_id"].as_str().unwrap_or("unknown");
-                format!("Uploaded '{}' — file_id: {}", filename, file_id)
-            }
-            Err(e) => format!("Upload failed: {}", e),
-        }
+        let logical = store_path.unwrap_or(filename);
+        self.upload_file_inner(&path, &logical).await
     }
 
-    #[tool(description = "Download a file from the channel file store by file_id and save it to a local path.")]
+    #[tool(description = "Download a file from the channel file store. Specify file_id for a pinned version, or store_path to get the latest version of a logical file.")]
     async fn download_file(
         &self,
-        Parameters(DownloadFileParams { file_id, save_path }): Parameters<DownloadFileParams>,
+        Parameters(DownloadFileParams { file_id, store_path, save_path }): Parameters<DownloadFileParams>,
     ) -> String {
-        let url = format!("{}/files/{}", self.broker_url, file_id);
+        let fid = if let Some(id) = file_id {
+            id
+        } else if let Some(ref spath) = store_path {
+            let channel = self.state.lock().await.channel.clone();
+            match self.broker.post::<serde_json::Value>("/file-latest", &serde_json::json!({
+                "channel": channel,
+                "path": spath
+            })).await {
+                Ok(v) => match v["id"].as_str() {
+                    Some(id) => id.to_string(),
+                    None => return format!("File not found: {}", spath),
+                },
+                Err(e) => return format!("Failed to find file: {}", e),
+            }
+        } else {
+            return "Provide either file_id or store_path".to_string();
+        };
+
+        let url = format!("{}/files/{}", self.broker_url, fid);
         let res = match self.broker.http.get(&url).send().await {
             Ok(r) => r,
             Err(e) => return format!("Download failed: {}", e),
@@ -739,7 +882,7 @@ impl CoworkerServer {
         }
     }
 
-    #[tool(description = "List files shared in the current channel.")]
+    #[tool(description = "List files shared in the current channel. Shows the latest version of each file by default.")]
     async fn list_files(
         &self,
         _: Parameters<ListFilesParams>,
@@ -753,8 +896,9 @@ impl CoworkerServer {
                 }
                 let mut out = format!("Files in #{}:\n", channel);
                 for f in &files {
-                    let id = f["id"].as_str().unwrap_or("");
-                    let name = f["filename"].as_str().unwrap_or("");
+                    let file_id = f["id"].as_str().unwrap_or("");
+                    let path = f["path"].as_str().unwrap_or("");
+                    let version = f["version"].as_u64().unwrap_or(1);
                     let size = f["size"].as_u64().unwrap_or(0);
                     let uploader = f["peer_name"].as_str().unwrap_or("");
                     let size_str = if size >= 1024 * 1024 {
@@ -764,10 +908,191 @@ impl CoworkerServer {
                     } else {
                         format!("{}B", size)
                     };
-                    out.push_str(&format!("  {} | {} | {} | {}\n", id, name, size_str, uploader));
+                    out.push_str(&format!("  [{}] {} v{} | {} | {} | id:{}\n",
+                        path, path, version, size_str, uploader, file_id));
                 }
                 out
             }
+            Err(e) => format!("Failed: {}", e),
+        }
+    }
+
+    #[tool(description = "Zip a local folder and upload it to the shared channel file store. Other agents can download and extract it with download_folder.")]
+    async fn upload_folder(
+        &self,
+        Parameters(UploadFolderParams { path, store_path }): Parameters<UploadFolderParams>,
+    ) -> String {
+        let folder_path = std::path::Path::new(&path);
+        if !folder_path.is_dir() {
+            return format!("Not a directory: {}", path);
+        }
+
+        let folder_name = folder_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string());
+
+        let logical = store_path.unwrap_or_else(|| format!("{}.zip", folder_name));
+
+        // Create zip in a temp file
+        let tmp_path = std::env::temp_dir().join(format!(
+            "agent-hive-{}-{}.zip",
+            folder_name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+
+        {
+            let zip_file = match std::fs::File::create(&tmp_path) {
+                Ok(f) => f,
+                Err(e) => return format!("Failed to create temp file: {}", e),
+            };
+
+            let mut zip = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            for entry in walkdir::WalkDir::new(&path).follow_links(false) {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => return format!("Error walking directory: {}", e),
+                };
+
+                let rel = match entry.path().strip_prefix(&path) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                if rel.as_os_str().is_empty() { continue; }
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+                if entry.file_type().is_dir() {
+                    if let Err(e) = zip.add_directory(&rel_str, options) {
+                        return format!("Failed to add dir {}: {}", rel_str, e);
+                    }
+                } else if entry.file_type().is_file() {
+                    if let Err(e) = zip.start_file(&rel_str, options) {
+                        return format!("Failed to start file {}: {}", rel_str, e);
+                    }
+                    let mut f = match std::fs::File::open(entry.path()) {
+                        Ok(f) => f,
+                        Err(e) => return format!("Failed to open {}: {}", rel_str, e),
+                    };
+                    let mut buf = Vec::new();
+                    if let Err(e) = f.read_to_end(&mut buf) {
+                        return format!("Failed to read {}: {}", rel_str, e);
+                    }
+                    if let Err(e) = zip.write_all(&buf) {
+                        return format!("Failed to write {}: {}", rel_str, e);
+                    }
+                }
+            }
+
+            if let Err(e) = zip.finish() {
+                return format!("Failed to finalize zip: {}", e);
+            }
+        }
+
+        let result = self.upload_file_inner(&tmp_path.to_string_lossy(), &logical).await;
+        let _ = std::fs::remove_file(&tmp_path);
+        result
+    }
+
+    #[tool(description = "Download a zip from the channel file store and extract it into a local directory. Use file_id for a specific version or store_path for the latest.")]
+    async fn download_folder(
+        &self,
+        Parameters(DownloadFolderParams { file_id, store_path, extract_to }): Parameters<DownloadFolderParams>,
+    ) -> String {
+        let fid = if let Some(id) = file_id {
+            id
+        } else if let Some(ref spath) = store_path {
+            let channel = self.state.lock().await.channel.clone();
+            match self.broker.post::<serde_json::Value>("/file-latest", &serde_json::json!({
+                "channel": channel,
+                "path": spath
+            })).await {
+                Ok(v) => match v["id"].as_str() {
+                    Some(id) => id.to_string(),
+                    None => return format!("File not found: {}", spath),
+                },
+                Err(e) => return format!("Failed to find file: {}", e),
+            }
+        } else {
+            return "Provide either file_id or store_path".to_string();
+        };
+
+        let url = format!("{}/files/{}", self.broker_url, fid);
+        let res = match self.broker.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return format!("Download failed: {}", e),
+        };
+        if !res.status().is_success() {
+            return format!("Download failed: HTTP {}", res.status());
+        }
+        let bytes = match res.bytes().await {
+            Ok(b) => b,
+            Err(e) => return format!("Failed to read response: {}", e),
+        };
+
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = match zip::ZipArchive::new(cursor) {
+            Ok(a) => a,
+            Err(e) => return format!("Not a valid zip archive: {}", e),
+        };
+
+        let target = std::path::Path::new(&extract_to);
+        if let Err(e) = std::fs::create_dir_all(target) {
+            return format!("Failed to create directory: {}", e);
+        }
+
+        let count = archive.len();
+        if let Err(e) = archive.extract(target) {
+            return format!("Extraction failed: {}", e);
+        }
+
+        format!("Extracted {} entries to {}", count, extract_to)
+    }
+
+    #[tool(description = "Send a message to ALL peers in your current channel at once. Use this instead of multiple send_message calls when you need to notify everyone.")]
+    async fn broadcast_message(
+        &self,
+        Parameters(BroadcastParams { text }): Parameters<BroadcastParams>,
+    ) -> String {
+        let from_id = match self.state.lock().await.id.clone() {
+            Some(id) => id,
+            None => return "Not registered".to_string(),
+        };
+        match self.broker.post::<serde_json::Value>("/broadcast-message", &serde_json::json!({
+            "from_id": from_id,
+            "text": text,
+        })).await {
+            Ok(v) => {
+                let count = v["count"].as_u64().unwrap_or(0);
+                format!("Broadcast sent to {} peer(s)", count)
+            }
+            Err(e) => format!("Broadcast failed: {}", e),
+        }
+    }
+
+    #[tool(description = "MASTER ONLY: Send an immediate abort signal to all workers in the channel. They will be notified on their next heartbeat (within 15s) to stop all current work and await further instructions.")]
+    async fn force_stop(&self, _: Parameters<ListFilesParams>) -> String {
+        let channel = self.state.lock().await.channel.clone();
+        match self.broker.post::<serde_json::Value>("/channel-abort", &serde_json::json!({
+            "channel": channel,
+        })).await {
+            Ok(_) => format!("⛔ Force-stop signal sent to all peers in #{}", channel),
+            Err(e) => format!("Failed: {}", e),
+        }
+    }
+
+    #[tool(description = "MASTER ONLY: Clear the force-stop signal so workers can resume accepting tasks.")]
+    async fn resume_work(&self, _: Parameters<ListFilesParams>) -> String {
+        let channel = self.state.lock().await.channel.clone();
+        match self.broker.post::<serde_json::Value>("/channel-resume", &serde_json::json!({
+            "channel": channel,
+        })).await {
+            Ok(_) => format!("✅ Abort cleared — workers in #{} may resume", channel),
             Err(e) => format!("Failed: {}", e),
         }
     }
@@ -822,6 +1147,7 @@ impl ServerHandler for CoworkerServer {
         let state = self.state.clone();
         let peer = context.peer.clone();
         let broker_url = self.broker_url.clone();
+        let tokens = self.tokens.clone();
 
         // All post-approval setup runs in one background task so MCP stays responsive
         tokio::spawn(async move {
@@ -881,7 +1207,7 @@ impl ServerHandler for CoworkerServer {
                 let notification = CustomNotification::new(
                     "notifications/claude/channel",
                     Some(serde_json::json!({
-                        "content": format!("[Agent Hive] Connected as {} in #{}", name, channel),
+                        "content": format!("[Agent Hive] Connected as **{}** in #{}.\nYour peer name is: {}. Use it in memory keys, e.g. result-{}, worker-status-{}.", name, channel, name, name, name),
                         "meta": {
                             "from_id": "agent-hive",
                             "from_summary": "startup",
@@ -1003,7 +1329,9 @@ impl ServerHandler for CoworkerServer {
             let broker3 = broker.clone();
             let state3 = state.clone();
             let peer3 = peer.clone();
+            let tokens3 = tokens.clone();
             tokio::spawn(async move {
+                let mut last_abort = false;
                 loop {
                     let my_id = {
                         let s = state3.lock().await;
@@ -1012,34 +1340,73 @@ impl ServerHandler for CoworkerServer {
                             None => { tokio::time::sleep(Duration::from_secs(15)).await; continue; }
                         }
                     };
-                    let body = serde_json::json!({ "id": my_id });
+                    let (ti, to) = tokens3.get();
+                    let body = serde_json::json!({ "id": my_id, "tokens_in": ti, "tokens_out": to });
                     if let Ok(hb) = broker3.post::<HeartbeatResponse>("/heartbeat", &body).await {
-                        let mut s = state3.lock().await;
-                        if hb.role != s.role {
-                            let prev = s.role.clone();
-                            s.role = hb.role.clone();
-                            let channel = s.channel.clone();
-                            drop(s);
-                            if !hb.role.is_empty() {
-                                flog!("Role updated: {}", &hb.role[..hb.role.len().min(80)]);
-                                let notification = CustomNotification::new(
-                                    "notifications/claude/channel",
-                                    Some(serde_json::json!({
-                                        "content": format!("[Your role in #{}]\n{}", channel, hb.role),
-                                        "meta": {
-                                            "from_id": "agent-hive",
-                                            "from_summary": "role assignment",
-                                            "from_cwd": "",
-                                            "from_harness": "agent-hive",
-                                            "sent_at": now_iso(),
-                                        }
-                                    })),
-                                );
-                                let _ = peer3.send_notification(ServerNotification::CustomNotification(notification)).await;
-                            } else if !prev.is_empty() {
-                                flog!("Role cleared");
+                        // role change
+                        {
+                            let mut s = state3.lock().await;
+                            if hb.role != s.role {
+                                let prev = s.role.clone();
+                                s.role = hb.role.clone();
+                                let channel = s.channel.clone();
+                                drop(s);
+                                if !hb.role.is_empty() {
+                                    flog!("Role updated: {}", &hb.role[..hb.role.len().min(80)]);
+                                    let notification = CustomNotification::new(
+                                        "notifications/claude/channel",
+                                        Some(serde_json::json!({
+                                            "content": format!("[Your role in #{}]\n{}", channel, hb.role),
+                                            "meta": {
+                                                "from_id": "agent-hive",
+                                                "from_summary": "role assignment",
+                                                "from_cwd": "",
+                                                "from_harness": "agent-hive",
+                                                "sent_at": now_iso(),
+                                            }
+                                        })),
+                                    );
+                                    let _ = peer3.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                } else if !prev.is_empty() {
+                                    flog!("Role cleared");
+                                }
                             }
                         }
+                        // abort signal
+                        if hb.abort && !last_abort {
+                            flog!("Abort signal received");
+                            let notification = CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": "⛔ ABORT — The Master has issued a force-stop. Stop all current work immediately. Do NOT start any new tasks. Report your current status to the Master via send_message, then wait for further instructions.",
+                                    "meta": {
+                                        "from_id": "agent-hive",
+                                        "from_summary": "abort signal",
+                                        "from_cwd": "",
+                                        "from_harness": "agent-hive",
+                                        "sent_at": now_iso(),
+                                    }
+                                })),
+                            );
+                            let _ = peer3.send_notification(ServerNotification::CustomNotification(notification)).await;
+                        } else if !hb.abort && last_abort {
+                            flog!("Abort cleared");
+                            let notification = CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": "✅ Abort cleared — you may resume accepting tasks from the Master.",
+                                    "meta": {
+                                        "from_id": "agent-hive",
+                                        "from_summary": "abort cleared",
+                                        "from_cwd": "",
+                                        "from_harness": "agent-hive",
+                                        "sent_at": now_iso(),
+                                    }
+                                })),
+                            );
+                            let _ = peer3.send_notification(ServerNotification::CustomNotification(notification)).await;
+                        }
+                        last_abort = hb.abort;
                     }
                     tokio::time::sleep(Duration::from_secs(15)).await;
                 }
