@@ -61,13 +61,23 @@ struct Peer {
 struct RegisterResponse {
     id: String,
     token: String,
+    #[serde(default = "default_main")]
+    channel: String,
+    #[serde(default)]
+    role: String,
 }
+
+fn default_main() -> String { "main".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct AuthStatusResponse {
     status: String,
     #[allow(dead_code)]
     peer_id: String,
+    #[serde(default = "default_main")]
+    channel: String,
+    #[serde(default)]
+    role: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -731,7 +741,14 @@ impl ServerHandler for CoworkerServer {
                 loop {
                     let body = serde_json::json!({ "token": token });
                     match broker.post::<AuthStatusResponse>("/auth/status", &body).await {
-                        Ok(r) if r.status == "approved" => { flog!("Approved!"); break; }
+                        Ok(r) if r.status == "approved" => {
+                            // Broker has already restored the peer's last channel — read it back
+                            flog!("Approved! Channel: #{}, Role: {}", r.channel, if r.role.is_empty() { "(none)" } else { &r.role });
+                            let mut s = state.lock().await;
+                            s.channel = r.channel;
+                            s.role = r.role;
+                            break;
+                        }
                         Ok(r) if r.status == "rejected" => { flog!("Rejected — exiting"); return; }
                         Ok(_) => {}
                         Err(e) => flog!("Approval poll error: {}", e),
@@ -739,8 +756,6 @@ impl ServerHandler for CoworkerServer {
                     tokio::time::sleep(Duration::from_millis(2000)).await;
                 }
             }
-
-            // Step 2: no channel persistence — always start in #main
 
             // --- Step 3: startup notifications ---
             // Small delay so Claude Code's channel listener is ready after the initialized handshake
@@ -985,131 +1000,19 @@ fn name_from_str(s: &str) -> String {
     format!("{}-{}", adj, noun)
 }
 
-// Encode a filesystem path the way Claude Code does for its projects directory.
-// Windows: D:\vibecode\foo → D--vibecode-foo
-// Unix:    /home/user/foo  → -home-user-foo
-fn encode_path_for_claude(cwd: &str) -> String {
-    #[cfg(windows)]
-    {
-        cwd.replace(":\\", "--").replace('\\', "-").replace('/', "-")
-    }
-    #[cfg(not(windows))]
-    {
-        cwd.replace('/', "-")
-    }
-}
-
-// Read the parent process's command line string.
-// On Windows: PowerShell + WMI (most reliable way to get parent cmdline).
-// On Linux:   /proc/self/status → PPid → /proc/$ppid/cmdline.
-fn get_parent_cmdline() -> Option<String> {
-    #[cfg(windows)]
-    {
-        let my_pid = std::process::id();
-        let script = format!(
-            "$ppid = (Get-WmiObject Win32_Process -Filter 'ProcessId={}').ParentProcessId; \
-             (Get-WmiObject Win32_Process -Filter \"ProcessId=$ppid\").CommandLine",
-            my_pid
-        );
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let ppid: u32 = status.lines()
-            .find(|l| l.starts_with("PPid:"))?
-            .split_whitespace().nth(1)?
-            .parse().ok()?;
-        let raw = std::fs::read_to_string(format!("/proc/{}/cmdline", ppid)).ok()?;
-        Some(raw.replace('\0', " "))
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    { None }
-}
-
-// Extract a --resume <uuid> argument from a command line string.
-fn extract_resume_uuid(cmdline: &str) -> Option<String> {
-    let pos = cmdline.find("--resume")?;
-    let after = cmdline[pos + "--resume".len()..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '=' || c == '"');
-    let uuid: String = after.chars()
-        .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-        .collect();
-    if uuid.len() == 36 && uuid.matches('-').count() == 4 {
-        Some(uuid)
-    } else {
-        None
-    }
-}
-
-// Find the active Claude Code session ID.
-//
-// Priority:
-//   1. --resume <uuid> in the parent (Claude Code) process command line — reliable for resumed sessions
-//   2. Most-recently-modified .jsonl file in ~/.claude/projects/<encoded-cwd>/ — works for new sessions
-fn get_claude_session_id(cwd: &str) -> Option<String> {
-    // 1. Resumed session: parent process was invoked with --resume <uuid>
-    if let Some(cmdline) = get_parent_cmdline() {
-        flog!("Parent cmdline: {}...", &cmdline[..cmdline.len().min(120)]);
-        if let Some(uuid) = extract_resume_uuid(&cmdline) {
-            flog!("Resumed session → {}", &uuid[..uuid.len().min(8)]);
-            return Some(uuid);
-        }
-    }
-
-    // 2. New session: newest .jsonl file in ~/.claude/projects/<encoded-cwd>/
-    let encoded = encode_path_for_claude(cwd);
-    flog!("Looking for session in ~/.claude/projects/{}/", encoded);
-    let projects_dir = dirs::home_dir()?
-        .join(".claude")
-        .join("projects")
-        .join(&encoded);
-
-    let best = std::fs::read_dir(&projects_dir).ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            let stem = e.path().file_stem()?.to_str()?.to_string();
-            Some((mtime, stem))
-        })
-        .max_by_key(|(t, _)| *t)
-        .map(|(_, id)| id);
-
-    if let Some(ref id) = best {
-        flog!("Newest session file → {}...", &id[..id.len().min(8)]);
-    } else {
-        flog!("No session files found in {:?}", projects_dir);
-    }
-    best
-}
-
-// Returns a stable name for this agent instance.
-//
-// Priority:
-//   1. AGENT_HIVE_NAME env override (manual)
-//   2. Active Claude session ID from ~/.claude/projects/<encoded-cwd>/ (stable across --resume)
-//   3. Fallback: hash of hostname + project path
-fn get_agent_name(hostname: &str, git_root: Option<&str>, cwd: &str) -> String {
+// Generate a fresh unique name for each connection using PID + timestamp.
+// No persistence, no file I/O — two clients in the same dir always get different names.
+fn generate_name() -> String {
     if let Ok(name) = env::var("AGENT_HIVE_NAME") {
         let n = name.trim().to_string();
         if !n.is_empty() { return n; }
     }
-
-    if let Some(session_id) = get_claude_session_id(cwd) {
-        flog!("Session ID: {}... → name", &session_id[..session_id.len().min(8)]);
-        return name_from_str(&session_id);
-    }
-
-    // Fallback: stable per hostname+project but no persistence needed
-    let project_key = git_root.unwrap_or(cwd).to_string();
-    let name = name_from_str(&format!("{}-{}", hostname, &project_key));
-    flog!("Fallback name from hostname+project: {}", name);
-    name
+    let pid = std::process::id();
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    name_from_str(&format!("{}-{}", pid, t))
 }
 
 fn get_git_root(cwd: &str) -> Option<String> {
@@ -1206,7 +1109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let my_name = get_agent_name(&my_hostname, git_root.as_deref(), &cwd);
+    let my_name = generate_name();
 
     log(&format!("CWD: {}", cwd));
     log(&format!(
@@ -1242,6 +1145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Switch to session token
     broker.set_token(reg.token.clone()).await;
 
+    log(&format!("Last channel: {}", reg.channel));
+
     // Set up state — approval and channel rejoin happen in on_initialized background task
     let state = Arc::new(Mutex::new(PeerState {
         id: Some(reg.id.clone()),
@@ -1249,8 +1154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token: Some(reg.token.clone()),
         cwd,
         git_root,
-        channel: "main".to_string(),
-        role: String::new(),
+        channel: reg.channel.clone(),
+        role: reg.role.clone(),
     }));
 
     // Create and run MCP server (starts immediately, no blocking on approval)
