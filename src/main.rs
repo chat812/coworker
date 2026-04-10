@@ -232,12 +232,32 @@ macro_rules! empty_tool_params {
     }
 }
 
-empty_tool_params!(CheckMessagesParams, ListChannelsParams, LeaveChannelParams);
+empty_tool_params!(CheckMessagesParams, ListChannelsParams, LeaveChannelParams, MemoryListParams);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct JoinChannelParams {
     #[schemars(description = "The channel name to join (e.g. 'backend-team')")]
     channel: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MemorySetParams {
+    #[schemars(description = "The key to store the value under (alphanumeric, dots, dashes, underscores; max 128 chars)")]
+    key: String,
+    #[schemars(description = "The value to store (max 64KB)")]
+    value: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MemoryGetParams {
+    #[schemars(description = "The key to retrieve")]
+    key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MemoryDeleteParams {
+    #[schemars(description = "The key to delete")]
+    key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +281,19 @@ struct JoinChannelResult {
     #[serde(default)]
     memory_keys: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryEntry {
+    key: String,
+    written_by: String,
+    written_at: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryGetResult {
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +516,111 @@ impl CoworkerServer {
             }
             Ok(r) => format!("Failed to join channel: {}", r.error.unwrap_or_default()),
             Err(e) => format!("Error joining channel: {}", e),
+        }
+    }
+
+#[tool(
+        name = "memory_set",
+        description = "Write a key-value pair to shared channel memory. All peers in the same channel can read it. Prefer this over send_message for large payloads (file contents, logs, command output)."
+    )]
+    async fn memory_set(
+        &self,
+        Parameters(MemorySetParams { key, value }): Parameters<MemorySetParams>,
+    ) -> String {
+        let state = self.state.lock().await;
+        let my_id = match &state.id {
+            Some(id) => id.clone(),
+            None => return "Not registered with broker yet".to_string(),
+        };
+        let channel = state.channel.clone();
+        drop(state);
+
+        let body = serde_json::json!({
+            "channel": channel,
+            "peer_id": my_id,
+            "entries": [{ "key": key, "value": value }],
+        });
+        match self.broker.post::<serde_json::Value>("/memory-set", &body).await {
+            Ok(_) => format!("Stored key \"{}\" in #{} memory ({} bytes)", key, channel, value.len()),
+            Err(e) => format!("Error writing memory: {}", e),
+        }
+    }
+
+    #[tool(
+        name = "memory_get",
+        description = "Read a value from shared channel memory by key."
+    )]
+    async fn memory_get(
+        &self,
+        Parameters(MemoryGetParams { key }): Parameters<MemoryGetParams>,
+    ) -> String {
+        let state = self.state.lock().await;
+        let channel = state.channel.clone();
+        drop(state);
+
+        let body = serde_json::json!({ "channel": channel, "key": key });
+        match self.broker.post::<MemoryGetResult>("/memory-get", &body).await {
+            Ok(r) => r.value,
+            Err(e) => format!("Error reading memory key \"{}\": {}", key, e),
+        }
+    }
+
+    #[tool(
+        name = "memory_list",
+        description = "List all keys stored in the current channel's shared memory, with size and author info."
+    )]
+    async fn memory_list(
+        &self,
+        Parameters(MemoryListParams {}): Parameters<MemoryListParams>,
+    ) -> String {
+        let state = self.state.lock().await;
+        let channel = state.channel.clone();
+        drop(state);
+
+        let body = serde_json::json!({ "channel": channel });
+        match self.broker.post::<serde_json::Value>("/memory-list", &body).await {
+            Ok(v) => {
+                let entries: Vec<MemoryEntry> = serde_json::from_value(
+                    v.get("entries").cloned().unwrap_or(serde_json::Value::Array(vec![]))
+                ).unwrap_or_default();
+                if entries.is_empty() {
+                    format!("No keys in #{} memory.", channel)
+                } else {
+                    let lines: Vec<String> = entries.iter().map(|e| {
+                        let size = if e.size >= 1024 {
+                            format!("{:.1}KB", e.size as f64 / 1024.0)
+                        } else {
+                            format!("{}B", e.size)
+                        };
+                        format!("{} ({}, by {}, at {})", e.key, size, e.written_by, &e.written_at[..16])
+                    }).collect();
+                    format!("{} key(s) in #{} memory:\n{}", entries.len(), channel, lines.join("\n"))
+                }
+            }
+            Err(e) => format!("Error listing memory: {}", e),
+        }
+    }
+
+    #[tool(
+        name = "memory_delete",
+        description = "Delete a key from shared channel memory."
+    )]
+    async fn memory_delete(
+        &self,
+        Parameters(MemoryDeleteParams { key }): Parameters<MemoryDeleteParams>,
+    ) -> String {
+        let state = self.state.lock().await;
+        let my_id = match &state.id {
+            Some(id) => id.clone(),
+            None => return "Not registered with broker yet".to_string(),
+        };
+        let channel = state.channel.clone();
+        drop(state);
+
+        let body = serde_json::json!({ "channel": channel, "key": key, "peer_id": my_id });
+        match self.broker.post::<serde_json::Value>("/memory-delete", &body).await {
+            Ok(_) => format!("Deleted key \"{}\" from #{} memory", key, channel),
+            Err(e) => format!("Error deleting memory key: {}", e),
         }
     }
 
@@ -847,43 +985,130 @@ fn name_from_str(s: &str) -> String {
     format!("{}-{}", adj, noun)
 }
 
-// Returns a stable name for this project on this machine.
-// Stored in ~/.agent-hive-names.json keyed by project path (git root or cwd).
-// This survives `claude --resume` since the project path doesn't change.
+// Encode a filesystem path the way Claude Code does for its projects directory.
+// Windows: D:\vibecode\foo → D--vibecode-foo
+// Unix:    /home/user/foo  → -home-user-foo
+fn encode_path_for_claude(cwd: &str) -> String {
+    #[cfg(windows)]
+    {
+        cwd.replace(":\\", "--").replace('\\', "-").replace('/', "-")
+    }
+    #[cfg(not(windows))]
+    {
+        cwd.replace('/', "-")
+    }
+}
+
+// Read the parent process's command line string.
+// On Windows: PowerShell + WMI (most reliable way to get parent cmdline).
+// On Linux:   /proc/self/status → PPid → /proc/$ppid/cmdline.
+fn get_parent_cmdline() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let my_pid = std::process::id();
+        let script = format!(
+            "$ppid = (Get-WmiObject Win32_Process -Filter 'ProcessId={}').ParentProcessId; \
+             (Get-WmiObject Win32_Process -Filter \"ProcessId=$ppid\").CommandLine",
+            my_pid
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let ppid: u32 = status.lines()
+            .find(|l| l.starts_with("PPid:"))?
+            .split_whitespace().nth(1)?
+            .parse().ok()?;
+        let raw = std::fs::read_to_string(format!("/proc/{}/cmdline", ppid)).ok()?;
+        Some(raw.replace('\0', " "))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    { None }
+}
+
+// Extract a --resume <uuid> argument from a command line string.
+fn extract_resume_uuid(cmdline: &str) -> Option<String> {
+    let pos = cmdline.find("--resume")?;
+    let after = cmdline[pos + "--resume".len()..].trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '=' || c == '"');
+    let uuid: String = after.chars()
+        .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+        .collect();
+    if uuid.len() == 36 && uuid.matches('-').count() == 4 {
+        Some(uuid)
+    } else {
+        None
+    }
+}
+
+// Find the active Claude Code session ID.
+//
+// Priority:
+//   1. --resume <uuid> in the parent (Claude Code) process command line — reliable for resumed sessions
+//   2. Most-recently-modified .jsonl file in ~/.claude/projects/<encoded-cwd>/ — works for new sessions
+fn get_claude_session_id(cwd: &str) -> Option<String> {
+    // 1. Resumed session: parent process was invoked with --resume <uuid>
+    if let Some(cmdline) = get_parent_cmdline() {
+        flog!("Parent cmdline: {}...", &cmdline[..cmdline.len().min(120)]);
+        if let Some(uuid) = extract_resume_uuid(&cmdline) {
+            flog!("Resumed session → {}", &uuid[..uuid.len().min(8)]);
+            return Some(uuid);
+        }
+    }
+
+    // 2. New session: newest .jsonl file in ~/.claude/projects/<encoded-cwd>/
+    let encoded = encode_path_for_claude(cwd);
+    flog!("Looking for session in ~/.claude/projects/{}/", encoded);
+    let projects_dir = dirs::home_dir()?
+        .join(".claude")
+        .join("projects")
+        .join(&encoded);
+
+    let best = std::fs::read_dir(&projects_dir).ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .filter_map(|e| {
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            let stem = e.path().file_stem()?.to_str()?.to_string();
+            Some((mtime, stem))
+        })
+        .max_by_key(|(t, _)| *t)
+        .map(|(_, id)| id);
+
+    if let Some(ref id) = best {
+        flog!("Newest session file → {}...", &id[..id.len().min(8)]);
+    } else {
+        flog!("No session files found in {:?}", projects_dir);
+    }
+    best
+}
+
+// Returns a stable name for this agent instance.
 //
 // Priority:
 //   1. AGENT_HIVE_NAME env override (manual)
-//   2. ~/.agent-hive-names.json[project_path] (stable per project)
-//   3. Generate from hostname+project, persist to file, return
+//   2. Active Claude session ID from ~/.claude/projects/<encoded-cwd>/ (stable across --resume)
+//   3. Fallback: hash of hostname + project path
 fn get_agent_name(hostname: &str, git_root: Option<&str>, cwd: &str) -> String {
     if let Ok(name) = env::var("AGENT_HIVE_NAME") {
         let n = name.trim().to_string();
         if !n.is_empty() { return n; }
     }
 
+    if let Some(session_id) = get_claude_session_id(cwd) {
+        flog!("Session ID: {}... → name", &session_id[..session_id.len().min(8)]);
+        return name_from_str(&session_id);
+    }
+
+    // Fallback: stable per hostname+project but no persistence needed
     let project_key = git_root.unwrap_or(cwd).to_string();
-    let names_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agent-hive-names.json");
-
-    // Load existing map
-    let mut map: serde_json::Map<String, serde_json::Value> =
-        std::fs::read_to_string(&names_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-
-    if let Some(existing) = map.get(&project_key).and_then(|v| v.as_str()) {
-        return existing.to_string();
-    }
-
-    // Generate new name, persist it
     let name = name_from_str(&format!("{}-{}", hostname, &project_key));
-    map.insert(project_key, serde_json::Value::String(name.clone()));
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(&names_path, json);
-    }
-    flog!("Generated new name '{}', saved to ~/.agent-hive-names.json", name);
+    flog!("Fallback name from hostname+project: {}", name);
     name
 }
 
