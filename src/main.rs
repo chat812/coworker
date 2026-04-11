@@ -55,6 +55,8 @@ struct Peer {
     hostname: String,
     summary: String,
     status: String,
+    #[serde(default)]
+    role: String,
     registered_at: String,
     last_seen: String,
 }
@@ -508,6 +510,7 @@ impl CoworkerServer {
                         if let Some(ref tty) = p.tty {
                             parts.push(format!("TTY: {}", tty));
                         }
+                        parts.push(format!("Role: {}", role_label(&p.role)));
                         if !p.summary.is_empty() {
                             parts.push(format!("Summary: {}", p.summary));
                         }
@@ -1075,7 +1078,7 @@ impl CoworkerServer {
         }
     }
 
-    #[tool(description = "MASTER ONLY: Send an immediate abort signal to all workers in the channel. They will be notified on their next heartbeat (within 15s) to stop all current work and await further instructions.")]
+    #[tool(description = "MASTER ONLY: Send an immediate abort signal to all workers in the channel. They will be notified on their next heartbeat (within 2s) to stop all current work and await further instructions.")]
     async fn force_stop(&self, _: Parameters<ListFilesParams>) -> String {
         let channel = self.state.lock().await.channel.clone();
         match self.broker.post::<serde_json::Value>("/channel-abort", &serde_json::json!({
@@ -1337,7 +1340,7 @@ impl ServerHandler for CoworkerServer {
                         let s = state3.lock().await;
                         match &s.id {
                             Some(id) => id.clone(),
-                            None => { tokio::time::sleep(Duration::from_secs(15)).await; continue; }
+                            None => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
                         }
                     };
                     let (ti, to) = tokens3.get();
@@ -1408,7 +1411,7 @@ impl ServerHandler for CoworkerServer {
                         }
                         last_abort = hb.abort;
                     }
-                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }); // end heartbeat spawn
         }); // end outer approval spawn
@@ -1416,6 +1419,19 @@ impl ServerHandler for CoworkerServer {
 }
 
 // --- Utility functions ---
+
+fn role_label(role: &str) -> String {
+    if role.contains("Master coordinator") { return "Master".to_string(); }
+    if role.contains("Vulnerability Researcher") { return "Vuln Researcher".to_string(); }
+    if role.contains("Vulnerability Validator") { return "Vuln Validator".to_string(); }
+    if role.contains("System Admin") { return "Sys Admin".to_string(); }
+    if role.contains("Worker agent") { return "Worker".to_string(); }
+    if role.contains("Executor agent") { return "Executor".to_string(); }
+    if role.contains("Advisor") { return "Advisor".to_string(); }
+    if role.is_empty() { return "(none)".to_string(); }
+    let first_line = role.lines().next().unwrap_or(role);
+    first_line.chars().take(80).collect()
+}
 
 fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
