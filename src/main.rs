@@ -110,6 +110,14 @@ struct TokenTracker {
     tokens_out: AtomicU64,
 }
 
+/// Tracks tool call activity so we can detect idle/stalled agents
+#[derive(Default)]
+struct ActivityTracker {
+    last_tool_call: AtomicU64,    // unix timestamp of last tool call
+    has_pending_msg: AtomicU64,   // 1 if a message was delivered and no tool call since
+    notified_master: AtomicU64,   // 1 if we already told Master about this stall
+}
+
 impl TokenTracker {
     /// Estimate token count: 1 token ≈ 4 bytes of text
     fn estimate(bytes: usize) -> u64 {
@@ -238,6 +246,7 @@ struct CoworkerServer {
     broker_url: String,
     tool_router: ToolRouter<Self>,
     tokens: Arc<TokenTracker>,
+    activity: Arc<ActivityTracker>,
 }
 
 impl CoworkerServer {
@@ -248,7 +257,16 @@ impl CoworkerServer {
             broker_url,
             tool_router: Self::tool_router(),
             tokens: Arc::new(TokenTracker::default()),
+            activity: Arc::new(ActivityTracker::default()),
         }
+    }
+
+    fn touch_activity(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.activity.last_tool_call.store(now, Ordering::Relaxed);
+        self.activity.has_pending_msg.store(0, Ordering::Relaxed);
+        self.activity.notified_master.store(0, Ordering::Relaxed);
     }
 }
 
@@ -371,6 +389,12 @@ struct BroadcastParams {
     text: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReportIssueParams {
+    #[schemars(description = "Describe your concern, blocker, or refusal reason. This is forwarded to Master automatically.")]
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChannelPeerSummary {
     id: String,
@@ -479,6 +503,7 @@ impl CoworkerServer {
         &self,
         Parameters(ListPeersParams { scope }): Parameters<ListPeersParams>,
     ) -> String {
+        self.touch_activity();
         let state = self.state.lock().await;
         let body = serde_json::json!({
             "scope": scope,
@@ -539,6 +564,7 @@ impl CoworkerServer {
         &self,
         Parameters(SendMessageParams { to_id, message }): Parameters<SendMessageParams>,
     ) -> String {
+        self.touch_activity();
         let state = self.state.lock().await;
         let my_id = match &state.id {
             Some(id) => id.clone(),
@@ -591,6 +617,7 @@ impl CoworkerServer {
         &self,
         Parameters(CheckMessagesParams {}): Parameters<CheckMessagesParams>,
     ) -> String {
+        self.touch_activity();
         let state = self.state.lock().await;
         let my_id = match &state.id {
             Some(id) => id.clone(),
@@ -1099,6 +1126,56 @@ impl CoworkerServer {
             Err(e) => format!("Failed: {}", e),
         }
     }
+
+    #[tool(
+        name = "report_issue",
+        description = "Report a concern, blocker, or status update to your Master coordinator. Use this INSTEAD of outputting text to the user — the user cannot see your text output. This tool automatically forwards your message to Master."
+    )]
+    async fn report_issue(
+        &self,
+        Parameters(params): Parameters<ReportIssueParams>,
+    ) -> String {
+        self.touch_activity();
+        let state = self.state.lock().await;
+        let my_id = match &state.id {
+            Some(id) => id.clone(),
+            None => return "Not registered with broker yet".to_string(),
+        };
+        drop(state);
+
+        // Find Master peer
+        let state = self.state.lock().await;
+        let list_body = serde_json::json!({
+            "scope": "all",
+            "cwd": state.cwd,
+            "git_root": state.git_root,
+        });
+        drop(state);
+
+        let master_id = match self.broker.post::<Vec<Peer>>("/list-peers", &list_body).await {
+            Ok(peers) => peers.iter()
+                .find(|p| p.role.contains("Master coordinator"))
+                .map(|p| p.id.clone()),
+            Err(_) => None,
+        };
+
+        let to_id = match master_id {
+            Some(id) => id,
+            None => return "No Master found in channel — issue logged locally only.".to_string(),
+        };
+
+        let body = serde_json::json!({
+            "from_id": my_id,
+            "to_id": to_id,
+            "text": format!("ISSUE REPORT: {}", params.message),
+        });
+
+        match self.broker.post::<SendResult>("/send-message", &body).await {
+            Ok(r) if r.ok => format!("Issue reported to Master ({})", to_id),
+            Ok(r) => format!("Failed to report: {}", r.error.unwrap_or_default()),
+            Err(e) => format!("Error: {}", e),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1151,6 +1228,7 @@ impl ServerHandler for CoworkerServer {
         let peer = context.peer.clone();
         let broker_url = self.broker_url.clone();
         let tokens = self.tokens.clone();
+        let server_activity = self.activity.clone();
 
         // All post-approval setup runs in one background task so MCP stays responsive
         tokio::spawn(async move {
@@ -1246,6 +1324,7 @@ impl ServerHandler for CoworkerServer {
             let broker2 = broker.clone();
             let state2 = state.clone();
             let peer2 = peer.clone();
+            let activity2 = server_activity.clone();
             tokio::spawn(async move {
             flog!("Polling loop started");
             loop {
@@ -1321,9 +1400,84 @@ impl ServerHandler for CoworkerServer {
                         Ok(_) => {
                             let preview: String = msg.text.chars().take(80).collect();
                             flog!("Sent OK: {}", preview);
+                            // Mark that we delivered a message — track if agent responds with tool calls
+                            activity2.has_pending_msg.store(1, Ordering::Relaxed);
                         }
                     }
                 }
+
+                // --- Idle detection ---
+                {
+                    let last = activity2.last_tool_call.load(Ordering::Relaxed);
+                    let pending = activity2.has_pending_msg.load(Ordering::Relaxed);
+                    let notified = activity2.notified_master.load(Ordering::Relaxed);
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0);
+
+                    if last > 0 {
+                        let idle_secs = now_secs.saturating_sub(last);
+
+                        // 30s idle + pending message: nudge the agent
+                        if pending == 1 && idle_secs > 30 {
+                            let nudge = CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": "⚠️ SYSTEM: You have not used any tools since receiving your last message. Your text output is NOT visible to anyone — the user and Master cannot see it. Use send_message to communicate with Master, or report_issue to flag a concern. Do NOT output text to the terminal.",
+                                    "meta": {
+                                        "from_id": "agent-hive",
+                                        "from_summary": "idle detection",
+                                        "from_cwd": "",
+                                        "from_harness": "agent-hive",
+                                        "sent_at": now_iso(),
+                                    }
+                                })),
+                            );
+                            let _ = peer2.send_notification(ServerNotification::CustomNotification(nudge)).await;
+                            activity2.has_pending_msg.store(0, Ordering::Relaxed);
+                            flog!("Sent idle nudge — agent has not used tools in {}s", idle_secs);
+                        }
+
+                        // 60s idle: agent is likely stalled (API rate limit, crash, etc.) — alert Master directly
+                        if idle_secs > 60 && notified == 0 {
+                            let my_id = {
+                                let s = state2.lock().await;
+                                s.id.clone().unwrap_or_default()
+                            };
+                            let my_name = {
+                                let s = state2.lock().await;
+                                s.name.clone()
+                            };
+                            if !my_id.is_empty() {
+                                // Find Master
+                                let s = state2.lock().await;
+                                let list_body = serde_json::json!({
+                                    "scope": "all",
+                                    "cwd": s.cwd,
+                                    "git_root": s.git_root,
+                                });
+                                drop(s);
+                                if let Ok(peers) = broker2.post::<Vec<Peer>>("/list-peers", &list_body).await {
+                                    if let Some(master) = peers.iter().find(|p| p.role.contains("Master coordinator")) {
+                                        let msg = format!(
+                                            "⚠️ AGENT STALLED: {} ({}) has not responded to any tool calls for {}s. Possible API rate limit, quota exhaustion, or crash. Consider reassigning their tasks.",
+                                            my_name, my_id, idle_secs
+                                        );
+                                        let body = serde_json::json!({
+                                            "from_id": my_id,
+                                            "to_id": master.id,
+                                            "text": msg,
+                                        });
+                                        let _ = broker2.post::<SendResult>("/send-message", &body).await;
+                                        flog!("Alerted Master about stall — {}s idle", idle_secs);
+                                    }
+                                }
+                                activity2.notified_master.store(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             }); // end polling spawn
