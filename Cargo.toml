@@ -1,6 +1,6 @@
 [package]
 name = "coworker"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Lightweight MCP server for claude-peers network"
 
