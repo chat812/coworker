@@ -4,8 +4,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
 
 use reqwest::Client;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -247,6 +249,7 @@ struct CoworkerServer {
     tool_router: ToolRouter<Self>,
     tokens: Arc<TokenTracker>,
     activity: Arc<ActivityTracker>,
+    ws_connected: Arc<AtomicBool>,
 }
 
 impl CoworkerServer {
@@ -258,6 +261,7 @@ impl CoworkerServer {
             tool_router: Self::tool_router(),
             tokens: Arc::new(TokenTracker::default()),
             activity: Arc::new(ActivityTracker::default()),
+            ws_connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1229,6 +1233,7 @@ impl ServerHandler for CoworkerServer {
         let broker_url = self.broker_url.clone();
         let tokens = self.tokens.clone();
         let server_activity = self.activity.clone();
+        let ws_connected = self.ws_connected.clone();
 
         // All post-approval setup runs in one background task so MCP stays responsive
         tokio::spawn(async move {
@@ -1320,14 +1325,197 @@ impl ServerHandler for CoworkerServer {
                 }
             }
 
-            // --- Step 4: polling loop ---
+            // --- Step 3.5: Agent WebSocket connection (push-based message delivery) ---
+            {
+                let broker_ws = broker.clone();
+                let state_ws = state.clone();
+                let peer_ws = peer.clone();
+                let tokens_ws = tokens.clone();
+                let broker_url_ws = broker_url.clone();
+                let ws_flag = ws_connected.clone();
+                let activity_ws = server_activity.clone();
+
+                tokio::spawn(async move {
+                    let mut reconnect_delay = Duration::from_secs(1);
+                    loop {
+                        let ws_url = broker_url_ws
+                            .replace("http://", "ws://")
+                            .replace("https://", "wss://");
+                        let token = { state_ws.lock().await.token.clone().unwrap_or_default() };
+                        let url = format!("{}/ws/agent?token={}", ws_url, urlencoding(&token));
+
+                        flog!("Connecting agent WS...");
+                        match tokio_tungstenite::connect_async(&url).await {
+                            Ok((ws_stream, _)) => {
+                                flog!("Agent WS connected");
+                                reconnect_delay = Duration::from_secs(1);
+                                ws_flag.store(true, Ordering::Relaxed);
+
+                                let (mut write, mut read) = ws_stream.split();
+
+                                // Spawn heartbeat ping sender over WS
+                                let tokens_ping = tokens_ws.clone();
+                                let ws_flag_ping = ws_flag.clone();
+                                let ping_handle = tokio::spawn(async move {
+                                    loop {
+                                        if !ws_flag_ping.load(Ordering::Relaxed) { break; }
+                                        let (ti, to) = tokens_ping.get();
+                                        let ping = serde_json::json!({ "type": "ping", "tokens_in": ti, "tokens_out": to });
+                                        if write.send(tokio_tungstenite::tungstenite::Message::Text(ping.to_string().into())).await.is_err() {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                    }
+                                });
+
+                                // Read loop — dispatch incoming events
+                                while let Some(Ok(msg)) = read.next().await {
+                                    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                            match event_type {
+                                                "message" => {
+                                                    let from_id = event.get("from_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let sent_at = event.get("sent_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    if from_id == "system" { continue; }
+
+                                                    // Look up sender info
+                                                    let (from_summary, from_cwd, from_harness) = {
+                                                        let s = state_ws.lock().await;
+                                                        let list_body = serde_json::json!({
+                                                            "scope": "all", "cwd": s.cwd, "git_root": s.git_root,
+                                                        });
+                                                        drop(s);
+                                                        match broker_ws.post::<Vec<Peer>>("/list-peers", &list_body).await {
+                                                            Ok(peers) => {
+                                                                if let Some(sender) = peers.iter().find(|p| p.id == from_id) {
+                                                                    (sender.summary.clone(), sender.cwd.clone(), sender.harness.clone())
+                                                                } else { (String::new(), String::new(), String::new()) }
+                                                            }
+                                                            Err(_) => (String::new(), String::new(), String::new()),
+                                                        }
+                                                    };
+
+                                                    activity_ws.has_pending_msg.store(1, Ordering::Relaxed);
+                                                    let notification = CustomNotification::new(
+                                                        "notifications/claude/channel",
+                                                        Some(serde_json::json!({
+                                                            "content": text,
+                                                            "meta": { "from_id": from_id, "from_summary": from_summary, "from_cwd": from_cwd, "from_harness": from_harness, "sent_at": sent_at }
+                                                        })),
+                                                    );
+                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                    flog!("WS msg from {}: {}", from_id, text.chars().take(80).collect::<String>());
+                                                }
+                                                "role_changed" => {
+                                                    let role = event.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let mut s = state_ws.lock().await;
+                                                    if role != s.role {
+                                                        s.role = role.clone();
+                                                        if !channel.is_empty() { s.channel = channel.clone(); }
+                                                        drop(s);
+                                                        if !role.is_empty() {
+                                                            let content = format!("[Your role in #{}]\n{}", channel, role);
+                                                            let notification = CustomNotification::new(
+                                                                "notifications/claude/channel",
+                                                                Some(serde_json::json!({ "content": content, "meta": { "from_id": "agent-hive", "from_summary": "role assignment", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                            );
+                                                            let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                            flog!("Role updated via WS");
+                                                        }
+                                                    } else { drop(s); }
+                                                }
+                                                "abort" => {
+                                                    let notification = CustomNotification::new(
+                                                        "notifications/claude/channel",
+                                                        Some(serde_json::json!({ "content": "⛔ ABORT — Master has ordered all work to stop.", "meta": { "from_id": "agent-hive", "from_summary": "abort", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                    );
+                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                    flog!("Abort via WS");
+                                                }
+                                                "abort_cleared" => {
+                                                    let notification = CustomNotification::new(
+                                                        "notifications/claude/channel",
+                                                        Some(serde_json::json!({ "content": "✅ Abort cleared — you may resume.", "meta": { "from_id": "agent-hive", "from_summary": "abort cleared", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                    );
+                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                }
+                                                "pong" => {} // heartbeat ack
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+
+                                ws_flag.store(false, Ordering::Relaxed);
+                                ping_handle.abort();
+                                flog!("Agent WS disconnected");
+                            }
+                            Err(e) => {
+                                flog!("Agent WS connection failed: {}", e);
+                            }
+                        }
+
+                        tokio::time::sleep(reconnect_delay).await;
+                        reconnect_delay = std::cmp::min(reconnect_delay * 2, Duration::from_secs(30));
+                    }
+                });
+            }
+
+            // --- Step 4: polling loop (HTTP fallback when WS is disconnected) ---
             let broker2 = broker.clone();
             let state2 = state.clone();
             let peer2 = peer.clone();
             let activity2 = server_activity.clone();
+            let ws_connected2 = ws_connected.clone();
             tokio::spawn(async move {
             flog!("Polling loop started");
             loop {
+                // Skip HTTP polling when WS is connected
+                if ws_connected2.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // Still run idle detection
+                    let last = activity2.last_tool_call.load(Ordering::Relaxed);
+                    let pending = activity2.has_pending_msg.load(Ordering::Relaxed);
+                    let notified = activity2.notified_master.load(Ordering::Relaxed);
+                    if last > 0 && pending == 1 {
+                        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        let idle_secs = now_secs.saturating_sub(last);
+                        if idle_secs > 30 {
+                            let nudge = CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": "⚠️ SYSTEM: You have not used any tools since receiving your last message. Your text output is NOT visible to anyone. Use send_message or report_issue.",
+                                    "meta": { "from_id": "agent-hive", "from_summary": "idle detection", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() }
+                                })),
+                            );
+                            let _ = peer2.send_notification(ServerNotification::CustomNotification(nudge)).await;
+                            activity2.has_pending_msg.store(0, Ordering::Relaxed);
+                        }
+                        if idle_secs > 60 && notified == 0 {
+                            // Alert Master directly via broker HTTP
+                            let my_id = { state2.lock().await.id.clone().unwrap_or_default() };
+                            let my_name = { state2.lock().await.name.clone() };
+                            if !my_id.is_empty() {
+                                let s = state2.lock().await;
+                                let list_body = serde_json::json!({ "scope": "all", "cwd": s.cwd, "git_root": s.git_root });
+                                drop(s);
+                                if let Ok(peers) = broker2.post::<Vec<Peer>>("/list-peers", &list_body).await {
+                                    if let Some(master) = peers.iter().find(|p| p.role.contains("Master coordinator")) {
+                                        let msg = format!("⚠️ AGENT STALLED: {} ({}) has not responded for {}s.", my_name, my_id, idle_secs);
+                                        let body = serde_json::json!({ "from_id": my_id, "to_id": master.id, "text": msg });
+                                        let _ = broker2.post::<serde_json::Value>("/send-message", &body).await;
+                                    }
+                                }
+                                activity2.notified_master.store(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let my_id = {
                     let s = state2.lock().await;
                     match &s.id {
@@ -1438,8 +1626,8 @@ impl ServerHandler for CoworkerServer {
                             flog!("Sent idle nudge — agent has not used tools in {}s", idle_secs);
                         }
 
-                        // 60s idle: agent is likely stalled (API rate limit, crash, etc.) — alert Master directly
-                        if idle_secs > 60 && notified == 0 {
+                        // 60s idle + pending message: agent received a task but never responded — likely stalled (API rate limit, crash)
+                        if pending == 1 && idle_secs > 60 && notified == 0 {
                             let my_id = {
                                 let s = state2.lock().await;
                                 s.id.clone().unwrap_or_default()
@@ -1482,14 +1670,20 @@ impl ServerHandler for CoworkerServer {
             }
             }); // end polling spawn
 
-            // --- Step 5: heartbeat loop ---
+            // --- Step 5: heartbeat loop (HTTP fallback — skipped when WS handles pings) ---
             let broker3 = broker.clone();
             let state3 = state.clone();
             let peer3 = peer.clone();
             let tokens3 = tokens.clone();
+            let ws_connected3 = ws_connected.clone();
             tokio::spawn(async move {
                 let mut last_abort = false;
                 loop {
+                    // Skip HTTP heartbeat when WS is connected (WS ping handles it)
+                    if ws_connected3.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
                     let my_id = {
                         let s = state3.lock().await;
                         match &s.id {
@@ -1585,6 +1779,17 @@ fn role_label(role: &str) -> String {
     if role.is_empty() { return "(none)".to_string(); }
     let first_line = role.lines().next().unwrap_or(role);
     first_line.chars().take(80).collect()
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn now_iso() -> String {
