@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 
 use reqwest::Client;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -249,7 +249,7 @@ struct CoworkerServer {
     tool_router: ToolRouter<Self>,
     tokens: Arc<TokenTracker>,
     activity: Arc<ActivityTracker>,
-    ws_connected: Arc<AtomicBool>,
+    sse_connected: Arc<AtomicBool>,
 }
 
 impl CoworkerServer {
@@ -261,7 +261,7 @@ impl CoworkerServer {
             tool_router: Self::tool_router(),
             tokens: Arc::new(TokenTracker::default()),
             activity: Arc::new(ActivityTracker::default()),
-            ws_connected: Arc::new(AtomicBool::new(false)),
+            sse_connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1233,7 +1233,7 @@ impl ServerHandler for CoworkerServer {
         let broker_url = self.broker_url.clone();
         let tokens = self.tokens.clone();
         let server_activity = self.activity.clone();
-        let ws_connected = self.ws_connected.clone();
+        let sse_connected = self.sse_connected.clone();
 
         // All post-approval setup runs in one background task so MCP stays responsive
         tokio::spawn(async move {
@@ -1325,136 +1325,113 @@ impl ServerHandler for CoworkerServer {
                 }
             }
 
-            // --- Step 3.5: Agent WebSocket connection (push-based message delivery) ---
+            // --- Step 3.5: Agent SSE connection (push-based message delivery, proxy-friendly) ---
             {
-                let broker_ws = broker.clone();
-                let state_ws = state.clone();
-                let peer_ws = peer.clone();
-                let tokens_ws = tokens.clone();
-                let broker_url_ws = broker_url.clone();
-                let ws_flag = ws_connected.clone();
-                let activity_ws = server_activity.clone();
+                let state_sse = state.clone();
+                let peer_sse = peer.clone();
+                let broker_url_sse = broker_url.clone();
+                let sse_flag = sse_connected.clone();
+                let activity_sse = server_activity.clone();
 
                 tokio::spawn(async move {
                     let mut reconnect_delay = Duration::from_secs(1);
                     loop {
-                        let ws_url = broker_url_ws
-                            .replace("http://", "ws://")
-                            .replace("https://", "wss://");
-                        let token = { state_ws.lock().await.token.clone().unwrap_or_default() };
-                        let url = format!("{}/ws/agent?token={}", ws_url, urlencoding(&token));
+                        let token = { state_sse.lock().await.token.clone().unwrap_or_default() };
+                        let url = format!("{}/events/agent?token={}", broker_url_sse, urlencoding(&token));
 
-                        flog!("Connecting agent WS...");
-                        match tokio_tungstenite::connect_async(&url).await {
-                            Ok((ws_stream, _)) => {
-                                flog!("Agent WS connected");
+                        flog!("Connecting agent SSE...");
+                        match reqwest::Client::new().get(&url).send().await {
+                            Ok(res) if res.status().is_success() => {
+                                flog!("Agent SSE connected");
                                 reconnect_delay = Duration::from_secs(1);
-                                ws_flag.store(true, Ordering::Relaxed);
+                                sse_flag.store(true, Ordering::Relaxed);
 
-                                let (mut write, mut read) = ws_stream.split();
+                                let mut stream = res.bytes_stream();
+                                let mut buffer = String::new();
 
-                                // Spawn heartbeat ping sender over WS
-                                let tokens_ping = tokens_ws.clone();
-                                let ws_flag_ping = ws_flag.clone();
-                                let ping_handle = tokio::spawn(async move {
-                                    loop {
-                                        if !ws_flag_ping.load(Ordering::Relaxed) { break; }
-                                        let (ti, to) = tokens_ping.get();
-                                        let ping = serde_json::json!({ "type": "ping", "tokens_in": ti, "tokens_out": to });
-                                        if write.send(tokio_tungstenite::tungstenite::Message::Text(ping.to_string().into())).await.is_err() {
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                    }
-                                });
-
-                                // Read loop — dispatch incoming events
-                                while let Some(Ok(msg)) = read.next().await {
-                                    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
-                                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&text) {
-                                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                            match event_type {
-                                                "message" => {
-                                                    let from_id = event.get("from_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let sent_at = event.get("sent_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    if from_id == "system" { continue; }
-
-                                                    // Look up sender info
-                                                    let (from_summary, from_cwd, from_harness) = {
-                                                        let s = state_ws.lock().await;
-                                                        let list_body = serde_json::json!({
-                                                            "scope": "all", "cwd": s.cwd, "git_root": s.git_root,
-                                                        });
-                                                        drop(s);
-                                                        match broker_ws.post::<Vec<Peer>>("/list-peers", &list_body).await {
-                                                            Ok(peers) => {
-                                                                if let Some(sender) = peers.iter().find(|p| p.id == from_id) {
-                                                                    (sender.summary.clone(), sender.cwd.clone(), sender.harness.clone())
-                                                                } else { (String::new(), String::new(), String::new()) }
+                                while let Some(chunk) = stream.next().await {
+                                    match chunk {
+                                        Err(e) => { flog!("SSE read error: {}", e); break; }
+                                        Ok(bytes) => {
+                                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                            while let Some(pos) = buffer.find("\n\n") {
+                                                let block = buffer[..pos].to_string();
+                                                buffer = buffer[pos + 2..].to_string();
+                                                for line in block.lines() {
+                                                    if let Some(data) = line.strip_prefix("data: ") {
+                                                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                                                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                                            match event_type {
+                                                                "message" => {
+                                                                    let from_id = event.get("from_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let sent_at = event.get("sent_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let from_summary = event.get("from_summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let from_cwd = event.get("from_cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let from_harness = event.get("from_harness").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    if from_id == "system" { continue; }
+                                                                    activity_sse.has_pending_msg.store(1, Ordering::Relaxed);
+                                                                    let notification = CustomNotification::new(
+                                                                        "notifications/claude/channel",
+                                                                        Some(serde_json::json!({
+                                                                            "content": text,
+                                                                            "meta": { "from_id": from_id, "from_summary": from_summary, "from_cwd": from_cwd, "from_harness": from_harness, "sent_at": sent_at }
+                                                                        })),
+                                                                    );
+                                                                    let _ = peer_sse.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                                    flog!("SSE msg from {}: {}", from_id, text.chars().take(80).collect::<String>());
+                                                                }
+                                                                "role_changed" => {
+                                                                    let role = event.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                                    let mut s = state_sse.lock().await;
+                                                                    if role != s.role {
+                                                                        s.role = role.clone();
+                                                                        if !channel.is_empty() { s.channel = channel.clone(); }
+                                                                        drop(s);
+                                                                        if !role.is_empty() {
+                                                                            let content = format!("[Your role in #{}]\n{}", channel, role);
+                                                                            let notification = CustomNotification::new(
+                                                                                "notifications/claude/channel",
+                                                                                Some(serde_json::json!({ "content": content, "meta": { "from_id": "agent-hive", "from_summary": "role assignment", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                                            );
+                                                                            let _ = peer_sse.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                                            flog!("Role updated via SSE");
+                                                                        }
+                                                                    } else { drop(s); }
+                                                                }
+                                                                "abort" => {
+                                                                    let notification = CustomNotification::new(
+                                                                        "notifications/claude/channel",
+                                                                        Some(serde_json::json!({ "content": "⛔ ABORT — Master has ordered all work to stop.", "meta": { "from_id": "agent-hive", "from_summary": "abort", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                                    );
+                                                                    let _ = peer_sse.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                                }
+                                                                "abort_cleared" => {
+                                                                    let notification = CustomNotification::new(
+                                                                        "notifications/claude/channel",
+                                                                        Some(serde_json::json!({ "content": "✅ Abort cleared — you may resume.", "meta": { "from_id": "agent-hive", "from_summary": "abort cleared", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
+                                                                    );
+                                                                    let _ = peer_sse.send_notification(ServerNotification::CustomNotification(notification)).await;
+                                                                }
+                                                                _ => {}
                                                             }
-                                                            Err(_) => (String::new(), String::new(), String::new()),
                                                         }
-                                                    };
-
-                                                    activity_ws.has_pending_msg.store(1, Ordering::Relaxed);
-                                                    let notification = CustomNotification::new(
-                                                        "notifications/claude/channel",
-                                                        Some(serde_json::json!({
-                                                            "content": text,
-                                                            "meta": { "from_id": from_id, "from_summary": from_summary, "from_cwd": from_cwd, "from_harness": from_harness, "sent_at": sent_at }
-                                                        })),
-                                                    );
-                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
-                                                    flog!("WS msg from {}: {}", from_id, text.chars().take(80).collect::<String>());
+                                                    }
                                                 }
-                                                "role_changed" => {
-                                                    let role = event.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let mut s = state_ws.lock().await;
-                                                    if role != s.role {
-                                                        s.role = role.clone();
-                                                        if !channel.is_empty() { s.channel = channel.clone(); }
-                                                        drop(s);
-                                                        if !role.is_empty() {
-                                                            let content = format!("[Your role in #{}]\n{}", channel, role);
-                                                            let notification = CustomNotification::new(
-                                                                "notifications/claude/channel",
-                                                                Some(serde_json::json!({ "content": content, "meta": { "from_id": "agent-hive", "from_summary": "role assignment", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
-                                                            );
-                                                            let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
-                                                            flog!("Role updated via WS");
-                                                        }
-                                                    } else { drop(s); }
-                                                }
-                                                "abort" => {
-                                                    let notification = CustomNotification::new(
-                                                        "notifications/claude/channel",
-                                                        Some(serde_json::json!({ "content": "⛔ ABORT — Master has ordered all work to stop.", "meta": { "from_id": "agent-hive", "from_summary": "abort", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
-                                                    );
-                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
-                                                    flog!("Abort via WS");
-                                                }
-                                                "abort_cleared" => {
-                                                    let notification = CustomNotification::new(
-                                                        "notifications/claude/channel",
-                                                        Some(serde_json::json!({ "content": "✅ Abort cleared — you may resume.", "meta": { "from_id": "agent-hive", "from_summary": "abort cleared", "from_cwd": "", "from_harness": "agent-hive", "sent_at": now_iso() } })),
-                                                    );
-                                                    let _ = peer_ws.send_notification(ServerNotification::CustomNotification(notification)).await;
-                                                }
-                                                "pong" => {} // heartbeat ack
-                                                _ => {}
                                             }
                                         }
                                     }
                                 }
 
-                                ws_flag.store(false, Ordering::Relaxed);
-                                ping_handle.abort();
-                                flog!("Agent WS disconnected");
+                                sse_flag.store(false, Ordering::Relaxed);
+                                flog!("Agent SSE disconnected");
+                            }
+                            Ok(res) => {
+                                flog!("Agent SSE connect failed: status {}", res.status());
                             }
                             Err(e) => {
-                                flog!("Agent WS connection failed: {}", e);
+                                flog!("Agent SSE connection error: {}", e);
                             }
                         }
 
@@ -1469,12 +1446,12 @@ impl ServerHandler for CoworkerServer {
             let state2 = state.clone();
             let peer2 = peer.clone();
             let activity2 = server_activity.clone();
-            let ws_connected2 = ws_connected.clone();
+            let sse_connected2 = sse_connected.clone();
             tokio::spawn(async move {
             flog!("Polling loop started");
             loop {
                 // Skip HTTP polling when WS is connected
-                if ws_connected2.load(Ordering::Relaxed) {
+                if sse_connected2.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     // Still run idle detection
                     let last = activity2.last_tool_call.load(Ordering::Relaxed);
@@ -1675,12 +1652,12 @@ impl ServerHandler for CoworkerServer {
             let state3 = state.clone();
             let peer3 = peer.clone();
             let tokens3 = tokens.clone();
-            let ws_connected3 = ws_connected.clone();
+            let sse_connected3 = sse_connected.clone();
             tokio::spawn(async move {
                 let mut last_abort = false;
                 loop {
                     // Skip HTTP heartbeat when WS is connected (WS ping handles it)
-                    if ws_connected3.load(Ordering::Relaxed) {
+                    if sse_connected3.load(Ordering::Relaxed) {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
